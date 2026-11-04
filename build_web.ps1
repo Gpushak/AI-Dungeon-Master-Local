@@ -43,6 +43,8 @@ Copy-Item (Join-Path $DistDir "AIDM.exe") $OutputDir
 
 $WorldsDest = Join-Path $OutputDir "worlds"
 New-Item -ItemType Directory -Path $WorldsDest | Out-Null
+$WorkflowsDest = Join-Path $OutputDir "workflows"
+New-Item -ItemType Directory -Path $WorkflowsDest | Out-Null
 
 # Пустой шаблон, без ключей и чужих миров: эту папку можно класть в zip.
 @'
@@ -62,6 +64,15 @@ New-Item -ItemType Directory -Path $WorldsDest | Out-Null
   "summary_enabled": true,
   "memory_enabled": true,
   "image_prompt_style": "sd",
+  "image_backend": "off",
+  "comfy_url": "http://127.0.0.1:8188",
+  "a1111_url": "http://127.0.0.1:7860",
+  "comfy_workflow": "scene_api.json",
+  "image_width": 1024,
+  "image_height": 1024,
+  "image_steps": 28,
+  "image_auto": false,
+  "image_send_negative": true,
   "language": "ru",
   "lan_access": true,
   "bind_mode": "lan"

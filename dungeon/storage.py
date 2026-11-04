@@ -15,6 +15,7 @@ from .config import (
     SETTINGS_FILE,
     WORLD_FILES,
     clamp_response_limits,
+    normalize_image_settings,
 )
 from .i18n import INTRO_PREFIX, normalize_prompt_overrides
 
@@ -255,6 +256,7 @@ def load_global_settings():
         "memory_enabled": True,
         "image_prompt_style": DEFAULT_IMAGE_STYLE,
         "image_look": DEFAULT_IMAGE_LOOK,
+        **normalize_image_settings(None),
         "response_limits": dict(clamp_response_limits(None)),
         "language": "ru",
         "prompt_overrides": {"ru": {}, "en": {}},
@@ -278,6 +280,7 @@ def load_global_settings():
         defaults["image_prompt_style"] = DEFAULT_IMAGE_STYLE
     if defaults.get("image_look") not in IMAGE_LOOKS:
         defaults["image_look"] = DEFAULT_IMAGE_LOOK
+    defaults.update(normalize_image_settings(defaults))
     defaults["response_limits"] = clamp_response_limits(defaults.get("response_limits"))
     defaults["summary_fill_percent"] = clamp_summary_fill_percent(defaults.get("summary_fill_percent", 80))
     defaults["prompt_overrides"] = normalize_prompt_overrides(defaults.get("prompt_overrides"))

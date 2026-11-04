@@ -1147,7 +1147,7 @@ function openPanel(name, extra) {
   applyCardDescription = null;
   panelTitle.textContent = t(`btn.${name === "settings" ? "ai_settings" : name === "files" ? "world_files" : name === "scene" ? "scene_prompt" : name}`);
   panelBody.innerHTML = "";
-  const loaders = { worlds: renderWorlds, files: renderFiles, cards: renderCards, memory: renderMemory, settings: renderSettings, prompt: renderPrompt, scene: renderScene };
+  const loaders = { worlds: renderWorlds, files: renderFiles, cards: renderCards, memory: renderMemory, settings: renderSettings, prompt: renderPrompt, scene: renderScene, gallery: renderGallery };
   loaders[name](extra);
   if (!panel.open) panel.showModal();
 }
@@ -1752,13 +1752,13 @@ async function renderScene(extra) {
     }).catch(() => {});
   }
 
-  function labeledBox(title, rows, value) {
+  function labeledBox(title, rows, value, onEdit) {
     const label = document.createElement("label");
     label.textContent = title;
     const area = document.createElement("textarea");
     area.rows = rows;
-    area.readOnly = true;
     area.value = value || "";
+    area.addEventListener("input", () => onEdit(area.value));
     label.append(area);
     return label;
   }
@@ -1788,25 +1788,79 @@ async function renderScene(extra) {
       note.textContent = state && state.world ? t("dialog.busy") : t("dialog.no_world");
     }
   });
-  const promptText = scene ? scene.prompt : "";
-  const negativeText = scene ? scene.negative : "";
+  let promptText = scene ? scene.prompt : "";
+  let negativeText = scene ? scene.negative : "";
+  let saveTimer = 0;
+  const imageButton = document.createElement("button");
+  imageButton.type = "button";
+  imageButton.textContent = t("btn.scene_image");
+  function syncImageButton() {
+    imageButton.disabled = !String(promptText || "").trim() || (data.image_backend || "off") === "off" || Boolean(scene && scene.image_pending);
+    copyPrompt.disabled = !promptText;
+    copyNegative.disabled = !negativeText;
+  }
+  function rememberText() {
+    syncImageButton();
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      api("/api/scene/text", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: promptText, negative: negativeText }),
+      }).catch(() => {});
+    }, 300);
+  }
+  imageButton.addEventListener("click", async () => {
+    note.textContent = "";
+    clearTimeout(saveTimer);
+    try {
+      const result = await api("/api/scene/image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: promptText, negative: negativeText }),
+      });
+      if (result && result.ok === false) {
+        note.className = "error";
+        note.textContent = result.notice || t("scene.image_off");
+      } else {
+        note.className = "hint";
+        note.textContent = t("status.scene_image");
+      }
+    } catch (error) {
+      note.className = "error";
+      note.textContent = state && state.world ? t("dialog.busy") : t("dialog.no_world");
+    }
+  });
+  let picture = null;
+  if (scene && scene.image) {
+    picture = document.createElement("img");
+    picture.className = "scene-image";
+    picture.alt = t("scene.image_alt");
+    picture.src = scene.image;
+  }
   const copies = document.createElement("div");
   copies.className = "row";
   const copyPrompt = document.createElement("button");
   copyPrompt.type = "button";
   copyPrompt.textContent = t("scene.copy_prompt");
-  copyPrompt.disabled = !promptText;
   copyPrompt.addEventListener("click", async () => {
     if (await copyText(promptText)) paintNotice(t("scene.copied_prompt"));
   });
   const copyNegative = document.createElement("button");
   copyNegative.type = "button";
   copyNegative.textContent = t("scene.copy_negative");
-  copyNegative.disabled = !negativeText;
   copyNegative.addEventListener("click", async () => {
     if (await copyText(negativeText)) paintNotice(t("scene.copied_negative"));
   });
-  copies.append(copyPrompt, copyNegative);
+    copies.append(copyPrompt, copyNegative);
+  syncImageButton();
+  if (scene && scene.image_pending) {
+    note.className = "hint";
+    note.textContent = t("status.scene_image");
+  }
+  const actions = document.createElement("div");
+  actions.className = "row";
+  actions.append(button, imageButton);
   panelBody.append(
     ...choiceRow("scene.format", data.image_styles || [], style, "image_style", (value) => {
       style = value;
@@ -1816,12 +1870,82 @@ async function renderScene(extra) {
       look = value;
       saveSceneOptions();
     }),
-    labeledBox(t("scene.prompt_label"), 8, promptText),
-    labeledBox(t("scene.negative_label"), 4, negativeText),
+    labeledBox(t("scene.prompt_label"), 8, promptText, (value) => {
+      promptText = value;
+      rememberText();
+    }),
+    labeledBox(t("scene.negative_label"), 4, negativeText, (value) => {
+      negativeText = value;
+      rememberText();
+    }),
+    ...(picture ? [picture] : []),
     note,
-    button,
+    actions,
     copies,
   );
+}
+
+async function renderGallery() {
+  let data;
+  try {
+    data = await api("/api/images");
+  } catch (error) {
+    const note = document.createElement("p");
+    note.className = "error";
+    note.textContent = state && state.world ? t("dialog.busy") : t("dialog.no_world");
+    panelBody.append(note);
+    return;
+  }
+  const images = data.images || [];
+  if (!images.length) {
+    const empty = document.createElement("p");
+    empty.textContent = t("gallery.empty");
+    panelBody.append(empty);
+    return;
+  }
+  const view = document.createElement("div");
+  const big = document.createElement("img");
+  big.className = "scene-image";
+  big.hidden = true;
+  big.alt = t("scene.image_alt");
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "danger";
+  del.textContent = t("gallery.delete");
+  del.hidden = true;
+  let selected = "";
+  del.addEventListener("click", async () => {
+    if (!selected || !window.confirm(t("gallery.delete_q"))) return;
+    try {
+      await api(`/api/images/${encodeURIComponent(selected)}`, { method: "DELETE" });
+      openPanel("gallery");
+    } catch (error) {
+      const note = document.createElement("p");
+      note.className = "error";
+      note.textContent = t("dialog.busy");
+      panelBody.append(note);
+    }
+  });
+  const grid = document.createElement("div");
+  grid.className = "gallery";
+  for (const item of images) {
+    const button = document.createElement("button");
+    button.type = "button";
+    const img = document.createElement("img");
+    img.src = item.url;
+    img.alt = item.name;
+    button.append(img);
+    button.addEventListener("click", () => {
+      selected = item.name;
+      big.src = item.url;
+      big.hidden = false;
+      del.hidden = false;
+      for (const other of grid.querySelectorAll("button")) other.setAttribute("aria-pressed", other === button ? "true" : "false");
+    });
+    grid.append(button);
+  }
+  view.append(big, del);
+  panelBody.append(view, grid);
 }
 
 async function renderSettings() {
@@ -2108,6 +2232,98 @@ function paintSettingsForm(preferredTab) {
     look.value = settingsCache.image_look || "none";
     look.addEventListener("change", () => { settingsCache.image_look = look.value; });
     lookLabel.append(look);
+    function workflowField() {
+      const wrap = document.createElement("label");
+      wrap.textContent = t("dialog.comfy_workflow");
+      const select = document.createElement("select");
+      const files = settingsCache.workflows || [];
+      const current = settingsCache.comfy_workflow || "";
+      const options = !current || files.includes(current) ? files.slice() : [current, ...files];
+      if (!options.length) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = t("dialog.workflow_empty");
+        select.append(empty);
+      }
+      for (const name of options) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        select.append(option);
+      }
+      if ([...select.options].some((option) => option.value === current)) select.value = current;
+      select.addEventListener("change", () => { settingsCache.comfy_workflow = select.value; });
+      wrap.append(select);
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = t("dialog.workflow_hint");
+      return [wrap, hint];
+    }
+    function imageGeneratorFields() {
+      const backendLabel = document.createElement("label");
+      backendLabel.textContent = t("dialog.image_backend");
+      const backend = document.createElement("select");
+      const names = settingsCache.image_backends || ["off", "comfy", "a1111"];
+      for (const name of names) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = t(`image_backend.${name}`);
+        backend.append(option);
+      }
+      backend.value = names.includes(settingsCache.image_backend) ? settingsCache.image_backend : "off";
+      backendLabel.append(backend);
+      const comfyBlock = document.createElement("div");
+      comfyBlock.append(field(t("dialog.comfy_url"), "comfy_url"), ...workflowField());
+      const a1111Block = document.createElement("div");
+      a1111Block.append(
+        field(t("dialog.a1111_url"), "a1111_url"),
+        field(t("dialog.image_width"), "image_width", { type: "number", min: 64, max: 4096, step: 8 }),
+        field(t("dialog.image_height"), "image_height", { type: "number", min: 64, max: 4096, step: 8 }),
+        field(t("dialog.image_steps"), "image_steps", { type: "number", min: 1, max: 150, step: 1 }),
+      );
+      const auto = check(t("dialog.image_auto"), "image_auto");
+      const sendNegative = check(t("dialog.image_send_negative"), "image_send_negative");
+      const test = document.createElement("button");
+      test.type = "button";
+      test.textContent = t("dialog.image_test");
+      const note = document.createElement("p");
+      note.className = "hint";
+      test.addEventListener("click", async () => {
+        note.textContent = "";
+        try {
+          const result = await api("/api/image/test", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              image_backend: settingsCache.image_backend,
+              comfy_url: settingsCache.comfy_url,
+              a1111_url: settingsCache.a1111_url,
+            }),
+          });
+          note.className = result && result.ok ? "hint" : "error";
+          note.textContent = (result && result.notice) || "";
+        } catch (error) {
+          note.className = "error";
+          note.textContent = actionErrorText(error) || t("scene.image_offline");
+        }
+      });
+      function sync() {
+        const selected = settingsCache.image_backend || "off";
+        comfyBlock.hidden = selected !== "comfy";
+        a1111Block.hidden = selected !== "a1111";
+        auto.hidden = selected === "off";
+        sendNegative.hidden = selected === "off";
+        test.hidden = selected === "off";
+        if (selected === "off") note.textContent = "";
+      }
+      backend.addEventListener("change", () => {
+        settingsCache.image_backend = backend.value;
+        sync();
+      });
+      sync();
+      return [heading(t("dialog.section_image")), backendLabel, comfyBlock, a1111Block, auto, sendNegative, test, note];
+    }
+    const imageNodes = imageGeneratorFields();
     const nodes = [
       heading(t("dialog.gen_params")),
       check(t("dialog.stream"), "stream_mode"),
@@ -2121,6 +2337,7 @@ function paintSettingsForm(preferredTab) {
       choice(t("dialog.memory_top_k"), "memory_top_k", ["3", "5", "7", "10"]),
       styleLabel,
       lookLabel,
+      ...imageNodes,
     ];
     if ((settingsCache.play_mode || "sandbox") !== "adventure") {
       nodes.push(

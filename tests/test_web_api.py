@@ -1,6 +1,7 @@
 """Проверка веб-версии через HTTP, без окна Tk и без сети."""
 
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,11 @@ def _use_tmp(tmp: Path):
     settings = tmp / "settings.json"
     config.BASE_DIR = tmp
     config.SETTINGS_FILE = settings
+    # Папка workflow не должна лежать внутри корня миров: игра считает каждую подпапку миром.
+    flows = Path(str(tmp) + "-workflows")
+    if flows.exists():
+        shutil.rmtree(flows)
+    config.WORKFLOWS_DIR = flows
     storage.BASE_DIR = tmp
     storage.SETTINGS_FILE = settings
     session_mod.BASE_DIR = tmp
@@ -1703,6 +1709,342 @@ def test_sandbox_flags_enable_mechanics_without_moving_worlds():
 
 
 
+def _tiny_png():
+    import base64
+
+    return base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+
+
+def _sd_workflow():
+    return {
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "model.safetensors"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "old positive", "clip": ["4", 1]}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "old negative", "clip": ["4", 1]}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        "3": {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": 1,
+                "steps": 20,
+                "cfg": 7,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1,
+                "model": ["4", 0],
+                "positive": ["6", 0],
+                "negative": ["7", 0],
+                "latent_image": ["5", 0],
+            },
+        },
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "scene", "images": ["8", 0]}},
+    }
+
+
+def test_comfy_prompt_injection_and_a1111_payload():
+    import base64
+    from unittest.mock import patch
+
+    from dungeon import image_gen
+
+    source = _sd_workflow()
+    updated, report = image_gen.apply_prompts(source, "a knight", "blurry", seed=42)
+    assert source["6"]["inputs"]["text"] == "old positive"
+    assert updated["6"]["inputs"]["text"] == "a knight"
+    assert updated["7"]["inputs"]["text"] == "blurry"
+    assert updated["3"]["inputs"]["seed"] == 42
+    assert updated["3"]["inputs"]["steps"] == 20
+    assert updated["4"]["inputs"]["ckpt_name"] == "model.safetensors"
+    assert updated["5"]["inputs"]["width"] == 512
+    assert updated["9"]["inputs"]["filename_prefix"] == "scene"
+    assert ("6", "text") in report["written"]
+    assert ("7", "text") in report["written"]
+
+    flux = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux.safetensors"}},
+        "9": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux"}},
+        "2": {
+            "class_type": "CLIPTextEncodeFlux",
+            "inputs": {"clip_l": "old l", "t5xxl": "old t5", "guidance": 3.5, "clip": ["9", 0]},
+        },
+        "3": {"class_type": "FluxGuidance", "inputs": {"guidance": 3.5, "conditioning": ["2", 0]}},
+        "5": {"class_type": "RandomNoise", "inputs": {"noise_seed": 5}},
+        "7": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["3", 0]}},
+    }
+    flux_out, _flux_report = image_gen.apply_prompts(flux, "river", "blur", seed=7)
+    assert flux_out["2"]["inputs"]["clip_l"] == "river"
+    assert flux_out["2"]["inputs"]["t5xxl"] == "river"
+    assert flux_out["2"]["inputs"]["guidance"] == 3.5
+    assert flux_out["5"]["inputs"]["noise_seed"] == 7
+    assert flux_out["1"]["inputs"]["unet_name"] == "flux.safetensors"
+
+    try:
+        image_gen.coerce_workflow({"nodes": [], "links": []})
+        raise AssertionError("ui workflow accepted")
+    except image_gen.ImageGenError as exc:
+        assert exc.code == "ui_workflow"
+    try:
+        image_gen.load_workflow(ROOT / "workflows" / "missing-scene.json")
+        raise AssertionError("missing workflow accepted")
+    except image_gen.ImageGenError as exc:
+        assert exc.code == "missing_workflow"
+
+    real = ROOT / "workflows" / "scene_api.json"
+    if real.is_file():
+        raw = json.loads(real.read_text(encoding="utf-8"))
+        coerced = image_gen.coerce_workflow(raw)
+        before = json.loads(json.dumps(coerced))
+        changed, real_report = image_gen.apply_prompts(coerced, "POSITIVE_MARK", "NEGATIVE_MARK", seed=11)
+        written = set(real_report["written"])
+        seeds = set(real_report["seeds"])
+        assert real_report["positive_nodes"]
+        for node_id, node in before.items():
+            assert changed[node_id]["class_type"] == node["class_type"]
+            for key, value in (node.get("inputs") or {}).items():
+                if (node_id, key) in written or (node_id, key) in seeds:
+                    continue
+                assert changed[node_id]["inputs"][key] == value
+
+    png = _tiny_png()
+    calls = []
+
+    class Resp:
+        def __init__(self, payload=None, content=b"", status=200):
+            self._payload = {} if payload is None else payload
+            self.content = content
+            self.status_code = status
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    def post(url, json=None, timeout=None):
+        calls.append((url, json))
+        return Resp({"images": [base64.b64encode(png).decode()]})
+
+    with patch("dungeon.image_gen.requests.post", post):
+        data = image_gen.generate_a1111("http://127.0.0.1:7860", "knight", "blur", 1024, 1024, 28, None)
+    assert data == png
+    assert calls[0][0].endswith("/sdapi/v1/txt2img")
+    assert calls[0][1]["prompt"] == "knight"
+    assert calls[0][1]["negative_prompt"] == "blur"
+    assert calls[0][1]["width"] == 1024
+    assert calls[0][1]["steps"] == 28
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "scene_api.json"
+        path.write_text(json.dumps(_sd_workflow()), encoding="utf-8")
+        posted = {}
+
+        def post_comfy(url, json=None, timeout=None):
+            posted["body"] = json
+            return Resp({"prompt_id": "abc"})
+
+        def get_comfy(url, params=None, timeout=None):
+            if str(url).endswith("/history/abc"):
+                return Resp(
+                    {
+                        "abc": {
+                            "outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}},
+                            "status": {"completed": True, "status_str": "success"},
+                        }
+                    }
+                )
+            assert params["filename"] == "a.png"
+            return Resp(content=png)
+
+        with patch("dungeon.image_gen.requests.post", post_comfy), patch("dungeon.image_gen.requests.get", get_comfy):
+            downloaded = image_gen.generate_comfy("http://127.0.0.1:8188", path, "a knight", "blurry", None)
+        assert downloaded == png
+        sent = posted["body"]["prompt"]
+        assert sent["6"]["inputs"]["text"] == "a knight"
+        assert sent["7"]["inputs"]["text"] == "blurry"
+        assert sent["5"]["inputs"]["width"] == 512
+        assert sent["3"]["inputs"]["seed"] != 1
+    print("OK  промпт попадает в граф ComfyUI и в запрос Automatic1111")
+
+
+def test_scene_image_api():
+    import tempfile
+    from unittest.mock import patch
+
+    from dungeon import image_gen
+
+    png = _tiny_png()
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        _use_tmp(tmp)
+        app = create_app()
+        session = app.state.session
+        client = TestClient(app)
+        saved = client.put(
+            "/api/settings",
+            json={
+                "image_backend": "comfy",
+                "comfy_url": "http://127.0.0.1:9000/",
+                "comfy_workflow": "workflows/scene_api.json",
+                "a1111_url": "not a url",
+                "image_width": 1000,
+                "image_height": 770,
+                "image_steps": 0,
+                "image_auto": True,
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        body = saved.json()
+        assert body["image_backend"] == "comfy"
+        assert body["comfy_url"] == "http://127.0.0.1:9000"
+        assert body["a1111_url"] == "http://127.0.0.1:7860"
+        assert body["comfy_workflow"] == "scene_api.json"
+        assert body["image_width"] == 1000
+        assert body["image_height"] == 768
+        assert body["image_steps"] == 1
+        assert body["image_auto"] is True
+        assert body["image_send_negative"] is True
+        stored = json.loads((tmp / "settings.json").read_text(encoding="utf-8"))
+        assert stored["image_backend"] == "comfy"
+        assert stored["image_auto"] is True
+        assert client.put("/api/settings", json={"image_backend": "midjourney"}).json()["image_backend"] == "off"
+        assert client.put("/api/settings", json={"image_backend": "a1111", "image_auto": False}).status_code == 200
+
+        assert client.post("/api/worlds", json={"name": "Camp"}).status_code == 200
+        assert (tmp / "Camp" / "img_bib").is_dir()
+        assert client.post("/api/worlds/open", json={"name": "Camp"}).status_code == 200
+        refused = client.post("/api/scene/image")
+        assert refused.status_code == 200, refused.text
+        assert refused.json()["ok"] is False
+
+        session.last_scene = {"prompt": "knight", "negative": "blur", "style": "sd", "look": "none"}
+        with patch("dungeon.image_gen.generate", return_value=png):
+            started = client.post("/api/scene/image")
+            assert started.status_code == 200, started.text
+            assert started.json()["ok"] is True
+            scene = _wait_scene_image(client)
+        assert scene["prompt"] == "knight"
+        assert scene["image"].startswith("/api/scene/image?name=")
+        picture = client.get(scene["image"])
+        assert picture.status_code == 200
+        assert picture.content == png
+        assert (tmp / "Camp" / "img_bib").is_dir()
+        assert not (tmp / "Camp" / "images").exists()
+        library = client.get("/api/images").json()["images"]
+        assert library and library[0]["name"] in scene["image"]
+        edited = client.put("/api/scene/text", json={"prompt": "edited knight", "negative": "dust"})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["scene"]["prompt"] == "edited knight"
+        assert client.get("/api/scene").json()["scene"]["negative"] == "dust"
+        seen = {}
+
+        def grab(_spec, prompt, negative, _cancel):
+            seen["prompt"] = prompt
+            seen["negative"] = negative
+            return png
+
+        with patch("dungeon.image_gen.generate", side_effect=grab):
+            sent = None
+            for _ in range(20):
+                sent = client.post("/api/scene/image", json={"prompt": "from button", "negative": "soft"})
+                if sent.status_code != 409:
+                    break
+                time.sleep(0.05)
+            assert sent.status_code == 200, sent.text
+            scene = _wait_scene_image(client)
+        assert seen["prompt"] == "from button"
+        assert seen["negative"] == "soft"
+        assert scene["prompt"] == "from button"
+        turned = client.put("/api/settings", json={"image_send_negative": False})
+        assert turned.status_code == 200, turned.text
+        assert turned.json()["image_send_negative"] is False
+        with patch("dungeon.image_gen.generate", side_effect=grab):
+            sent = None
+            for _ in range(20):
+                sent = client.post("/api/scene/image", json={"prompt": "from button", "negative": "soft"})
+                if sent.status_code != 409:
+                    break
+                time.sleep(0.05)
+            assert sent.status_code == 200, sent.text
+            scene = _wait_scene_image(client)
+        assert seen["negative"] == ""
+        assert scene["negative"] == "soft"
+        current_name = scene["image"].split("name=", 1)[-1]
+        removed = client.delete(f"/api/images/{current_name}")
+        assert removed.status_code == 200, removed.text
+        assert all(item["name"] != current_name for item in removed.json()["images"])
+        assert client.get("/api/scene/image", params={"name": current_name}).status_code == 404
+        assert client.get("/api/scene").json()["scene"]["image"] == ""
+        assert client.delete("/api/images/../settings.json").status_code in (404, 405, 400)
+        flows = config.WORKFLOWS_DIR
+        (flows / "other.json").write_text("{}", encoding="utf-8")
+        (flows / "notes.txt").write_text("no", encoding="utf-8")
+        (tmp / "outside.json").write_text("{}", encoding="utf-8")
+        assert client.get("/api/workflows").json()["workflows"] == ["other.json"]
+        assert client.get("/api/scene/image", params={"name": "../settings.json"}).status_code == 404
+        assert client.get("/api/scene/image", params={"name": "settings.json"}).status_code == 404
+        (tmp / "secret.png").write_bytes(png)
+        assert client.get("/api/scene/image", params={"name": "secret.png"}).status_code == 404
+
+        class Resp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {}
+
+        with patch("dungeon.image_gen.requests.get", return_value=Resp()):
+            tested = client.post(
+                "/api/image/test",
+                json={"image_backend": "comfy", "comfy_url": "http://127.0.0.1:8188"},
+            )
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["ok"] is True
+
+        spec = session.image_spec()
+        spec["image_backend"] = "comfy"
+        try:
+            image_gen.generate(spec, "knight", "", None)
+            raise AssertionError("missing workflow accepted")
+        except image_gen.ImageGenError as exc:
+            assert exc.code == "missing_workflow"
+
+        history = ["Игрок: осмотреться", "Мастер: Тропа вывела к реке."]
+        (tmp / "Camp" / "history.json").write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+        assert client.post("/api/worlds/open", json={"name": "Camp"}).status_code == 200
+        session.last_scene = None
+        assert client.put("/api/settings", json={"image_backend": "a1111", "image_auto": True}).status_code == 200
+
+        def post(payload, **_kwargs):
+            return _Response()
+
+        def finish_read(_response, _key, on_delta=None):
+            return '{"prompt": "a river", "negative_prompt": "blur"}', False
+
+        session._api_post = post
+        session._read_response = finish_read
+        with patch("dungeon.image_gen.generate", return_value=png) as generate:
+            assert client.post("/api/scene", json={"image_prompt_style": "sd", "image_look": "none"}).status_code == 200
+            scene = _wait_scene_image(client)
+        assert generate.called
+        assert "a river" in scene["prompt"]
+        assert scene["image"].startswith("/api/scene/image?name=")
+        assert client.get(scene["image"]).content == png
+    print("OK  картинка сцены сохраняется в мире и не читается снаружи папки")
+
+
+def _wait_scene_image(client, timeout=4):
+    deadline = time.time() + timeout
+    scene = None
+    while time.time() < deadline:
+        scene = client.get("/api/scene").json()["scene"]
+        if scene and scene.get("image") and not scene.get("image_pending"):
+            return scene
+        time.sleep(0.05)
+    raise AssertionError(f"картинка не появилась: {scene}")
+
+
 if __name__ == "__main__":
     test_file_save_and_summary_threshold()
     test_history_opens_on_the_tail()
@@ -1730,4 +2072,6 @@ if __name__ == "__main__":
     test_d20_prompt_names_each_outcome()
     test_named_foe_gets_a_card_and_unnamed_guard_does_not()
     test_sandbox_flags_enable_mechanics_without_moving_worlds()
+    test_comfy_prompt_injection_and_a1111_payload()
+    test_scene_image_api()
     print("ALL WEB TESTS PASSED")

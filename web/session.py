@@ -4,24 +4,32 @@ from __future__ import annotations
 
 import io
 import queue
+import re
 import shutil
 import threading
 import zipfile
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import quote
 
 import dungeon.adventure as adventure_rules
 from dungeon.ai_engine import ACTION, CARDS, AIEngineMixin
-from dungeon.api_stream import MEMORY, SCENE, SCENE_TURNS, SUMMARY
+from dungeon.api_stream import IMAGE, MEMORY, SCENE, SCENE_TURNS, SUMMARY
+from dungeon import image_gen
 from dungeon.session import SharedTurnMixin
 from dungeon.config import (
     BASE_DIR,
     DEFAULT_IMAGE_LOOK,
     DEFAULT_IMAGE_STYLE,
     DEFAULT_RESPONSE_LIMITS,
+    IMAGE_BACKENDS,
     IMAGE_LOOKS,
     IMAGE_PROMPT_STYLES,
     INTRODUCTION_FILE,
     WORLD_FILES,
     clamp_response_limits,
+    list_workflow_files,
+    normalize_image_settings,
     response_token_limit,
 )
 from dungeon.i18n import (
@@ -235,6 +243,9 @@ class _UiBridge:
             callback(*args)
 
 
+_SCENE_IMAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.(png|jpg|jpeg|webp)$")
+IMAGE_LIBRARY = "img_bib"
+
 # Сколько хвоста отдавать странице за один раз: не весь мир, а читаемый кусок.
 HISTORY_PAGE_MESSAGES = 40
 HISTORY_PAGE_CHARS = 14000
@@ -298,6 +309,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.image_look = settings.get("image_look", DEFAULT_IMAGE_LOOK)
         if self.image_look not in IMAGE_LOOKS:
             self.image_look = DEFAULT_IMAGE_LOOK
+        self._apply_image_settings(normalize_image_settings(settings))
         self.response_limits = clamp_response_limits(settings.get("response_limits"))
         self.covered_count = 0
         self.context_ratio = 0.0
@@ -315,6 +327,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.memory_indexing = False
         self.summary_indexing = False
         self.scene_prompt_running = False
+        self.scene_image_running = False
+        self._image_target = None
         self._schedule_summary_after_turn = False
         self._schedule_memory_after_turn = False
         self._cancel_events = {}
@@ -561,6 +575,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             or self.memory_indexing
             or self.summary_indexing
             or self.scene_prompt_running
+            or self.scene_image_running
             or self.cards_running
         )
 
@@ -623,7 +638,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         with self._job_lock:
             if self.summary_indexing or not self.current_world_path:
                 return
-            if self.processing or self.scene_prompt_running or self.cards_running:
+            if self.processing or self.scene_prompt_running or self.scene_image_running or self.cards_running:
                 return
             self.summary_indexing = True
         self._begin_operation(SUMMARY)
@@ -636,7 +651,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 return
             if not self.memory_enabled and not force:
                 return
-            if self.processing or self.scene_prompt_running or self.cards_running:
+            if self.processing or self.scene_prompt_running or self.scene_image_running or self.cards_running:
                 return
             self.memory_indexing = True
         self._begin_operation(MEMORY)
@@ -658,14 +673,24 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         return True
 
     def show_scene_prompt(self, scene_prompt, negative_prompt, style="sd", look="none"):
+        auto = (
+            bool(self.image_auto)
+            and self.image_backend in ("comfy", "a1111")
+            and bool(str(scene_prompt or "").strip())
+        )
         self.last_scene = {
             "prompt": scene_prompt,
             "negative": negative_prompt,
             "style": style,
             "look": look,
+            "image": "",
+            "image_file": "",
+            "image_pending": auto,
         }
         self.emit("scene", **self.last_scene)
         self.add_system_message(self.tr("msg.scene_prompt_done"))
+        if auto:
+            self._arm_scene_image()
 
     def scene_view(self):
         return {
@@ -674,7 +699,207 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "image_styles": list(IMAGE_PROMPT_STYLES),
             "image_look": self.image_look,
             "image_looks": list(IMAGE_LOOKS),
+            "image_backend": self.image_backend,
         }
+
+    def update_scene_text(self, prompt, negative=""):
+        """Запоминает правку промпта, не запуская генерацию и не перерисовывая панель."""
+        if not self.current_world_path:
+            return None
+        scene = dict(self.last_scene or {})
+        scene["prompt"] = str(prompt if prompt is not None else "")
+        scene["negative"] = str(negative if negative is not None else "")
+        scene.setdefault("style", self.image_prompt_style)
+        scene.setdefault("look", self.image_look)
+        scene.setdefault("image", "")
+        scene.setdefault("image_file", "")
+        scene.setdefault("image_pending", False)
+        self.last_scene = scene
+        return self.scene_view()
+
+    def start_scene_image(self):
+        with self._job_lock:
+            if self.is_busy() or not self.current_world_path:
+                return False
+            prompt = str((self.last_scene or {}).get("prompt") or "").strip()
+            if not prompt:
+                self.add_system_message(self.tr("scene.needs_prompt"))
+                return False
+            if self.image_backend not in ("comfy", "a1111"):
+                self.add_system_message(self.tr("scene.image_off"))
+                return False
+            self.last_scene = dict(self.last_scene)
+            self.last_scene["image_pending"] = True
+            self.emit("scene", **self.last_scene)
+            return self._arm_scene_image()
+
+    def _arm_scene_image(self):
+        self.scene_image_running = True
+        self._image_target = {
+            "backend": self.image_backend,
+            "url": self.comfy_url if self.image_backend == "comfy" else self.a1111_url,
+        }
+        self._begin_operation(IMAGE)
+        self.refresh_busy_state()
+        threading.Thread(target=self._run_scene_image, daemon=True).start()
+        return True
+
+    def _run_scene_image(self):
+        scene = dict(self.last_scene or {})
+        prompt = str(scene.get("prompt") or "").strip()
+        negative = str(scene.get("negative") or "")
+        if not self.image_send_negative:
+            negative = ""
+        spec = self.image_spec()
+        cancel = self._cancel_events.get(IMAGE)
+        try:
+            data = image_gen.generate(spec, prompt, negative, cancel)
+            if not data:
+                self._finish_scene_image(stopped=True)
+                return
+            name = self._save_scene_image(data)
+            self._finish_scene_image(name=name)
+        except image_gen.ImageGenError as exc:
+            self._finish_scene_image(error=exc)
+        except Exception as exc:
+            self._finish_scene_image(error=exc)
+        finally:
+            self.scene_image_running = False
+            self._image_target = None
+            self._end_operation(IMAGE)
+            self.refresh_busy_state()
+
+    def _finish_scene_image(self, name=None, error=None, stopped=False):
+        scene = dict(self.last_scene or {})
+        scene["image_pending"] = False
+        if name:
+            scene["image_file"] = name
+            scene["image"] = "/api/scene/image?name=" + quote(name)
+            self.last_scene = scene
+            self.emit("scene", **scene)
+            self.add_system_message(self.tr("msg.scene_image_done"))
+            return
+        self.last_scene = scene or None
+        if scene:
+            self.emit("scene", **scene)
+        if stopped:
+            self.add_system_message(self.tr("msg.image_stopped"))
+        elif error is not None:
+            self.add_system_message(self._image_error_text(error))
+
+    def _image_library_dir(self):
+        if not self.current_world_path:
+            return None
+        return (Path(self.current_world_path) / IMAGE_LIBRARY).resolve()
+
+    def _ensure_image_library(self, world_path):
+        folder = Path(world_path) / IMAGE_LIBRARY
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def image_library_view(self):
+        folder = self._image_library_dir()
+        items = []
+        if folder is not None and folder.is_dir():
+            files = [path for path in folder.iterdir() if path.is_file() and _SCENE_IMAGE_NAME.fullmatch(path.name)]
+            files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+            items = [
+                {"name": path.name, "url": "/api/scene/image?name=" + quote(path.name)}
+                for path in files
+            ]
+        return {"images": items}
+
+    def delete_scene_image(self, name):
+        path = self.scene_image_path(name)
+        if path is None:
+            return False
+        path.unlink()
+        if self.last_scene and self.last_scene.get("image_file") == path.name:
+            scene = dict(self.last_scene)
+            scene["image"] = ""
+            scene["image_file"] = ""
+            scene["image_pending"] = False
+            self.last_scene = scene
+            self.emit("scene", **scene)
+        return True
+
+    def _save_scene_image(self, data):
+        suffix = image_gen.image_suffix(data)
+        folder = self._ensure_image_library(self.current_world_path)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"{stamp}{suffix}"
+        path = folder / name
+        if path.exists():
+            name = f"{stamp}-{datetime.now().strftime('%f')}{suffix}"
+            path = folder / name
+        path.write_bytes(data)
+        return name
+
+    def scene_image_path(self, name=None):
+        """Файл картинки только из img_bib текущего мира. Чужой путь не отдаётся."""
+        if not self.current_world_path:
+            return None
+        raw = name if name is not None else ((self.last_scene or {}).get("image_file") or "")
+        raw = str(raw or "")
+        if not raw or raw != Path(raw).name or not _SCENE_IMAGE_NAME.fullmatch(raw):
+            return None
+        folder = self._image_library_dir()
+        candidate = (folder / raw).resolve()
+        if candidate.parent != folder or not candidate.is_file():
+            return None
+        return candidate
+
+    def image_spec(self):
+        return {
+            "image_backend": self.image_backend,
+            "comfy_url": self.comfy_url,
+            "a1111_url": self.a1111_url,
+            "comfy_workflow": self.comfy_workflow,
+            "image_width": self.image_width,
+            "image_height": self.image_height,
+            "image_steps": self.image_steps,
+            "image_send_negative": self.image_send_negative,
+        }
+
+    def test_image_connection(self, payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        current = self.image_spec()
+        current["image_auto"] = self.image_auto
+        current.update({key: payload[key] for key in current if key in payload})
+        spec = normalize_image_settings(current)
+        url = spec["comfy_url"] if spec["image_backend"] == "comfy" else spec["a1111_url"]
+        try:
+            image_gen.test_connection(spec["image_backend"], url)
+        except image_gen.ImageGenError as exc:
+            return {"ok": False, "notice": self._image_error_text(exc)}
+        return {"ok": True, "notice": self.tr("scene.image_test_ok")}
+
+    def _apply_image_settings(self, spec):
+        self.image_backend = spec["image_backend"]
+        self.comfy_url = spec["comfy_url"]
+        self.a1111_url = spec["a1111_url"]
+        self.comfy_workflow = spec["comfy_workflow"]
+        self.image_width = spec["image_width"]
+        self.image_height = spec["image_height"]
+        self.image_steps = spec["image_steps"]
+        self.image_auto = spec["image_auto"]
+        self.image_send_negative = spec["image_send_negative"]
+
+    def _image_error_text(self, exc):
+        if isinstance(exc, image_gen.ImageGenError):
+            key = {
+                "missing_workflow": "scene.image_missing_workflow",
+                "ui_workflow": "scene.image_ui_workflow",
+                "bad_workflow": "scene.image_bad_workflow",
+                "no_prompt_nodes": "scene.image_no_nodes",
+                "offline": "scene.image_offline",
+                "rejected": "scene.image_rejected",
+                "empty": "scene.image_empty",
+                "timeout": "scene.image_timeout",
+                "backend_off": "scene.image_off",
+            }.get(exc.code, "msg.scene_image_fail")
+            return self.tr(key, msg=exc.detail or "")
+        return self.tr("msg.scene_image_fail", msg=str(exc))
 
     def set_scene_options(self, style=None, look=None):
         """Запоминает формат модели и визуальный стиль, выбранные на вкладке сцены."""
@@ -742,6 +967,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             text = self.tr("status.summary")
         elif self.memory_indexing:
             text = self.tr("status.memory")
+        elif self.scene_image_running:
+            text = self.tr("status.scene_image")
         elif self.scene_prompt_running:
             text = self.tr("status.scene_prompt")
         elif self.cards_running:
@@ -998,6 +1225,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 "memory_enabled": self.memory_enabled,
                 "image_prompt_style": self.image_prompt_style,
                 "image_look": self.image_look,
+                **self.image_spec(),
+                "image_auto": self.image_auto,
                 "response_limits": self.response_limits,
                 "language": self.language,
                 "prompt_overrides": self.prompt_overrides,
@@ -1051,6 +1280,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "image_styles": list(IMAGE_PROMPT_STYLES),
             "image_look": self.image_look,
             "image_looks": list(IMAGE_LOOKS),
+            "image_backends": list(IMAGE_BACKENDS),
+            **self.image_spec(),
+            "image_auto": self.image_auto,
+            "workflows": list_workflow_files(),
             "response_limits": dict(self.response_limits),
             "language": self.language,
             "lan_access": self.lan_access,
@@ -1115,6 +1348,22 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.image_prompt_style = style if style in IMAGE_PROMPT_STYLES else DEFAULT_IMAGE_STYLE
         look = payload.get("image_look", self.image_look)
         self.image_look = look if look in IMAGE_LOOKS else DEFAULT_IMAGE_LOOK
+        current = self.image_spec()
+        current["image_auto"] = self.image_auto
+        for key in (
+            "image_backend",
+            "comfy_url",
+            "a1111_url",
+            "comfy_workflow",
+            "image_width",
+            "image_height",
+            "image_steps",
+            "image_auto",
+            "image_send_negative",
+        ):
+            if key in payload:
+                current[key] = payload[key]
+        self._apply_image_settings(normalize_image_settings(current))
         if "response_limits" in payload:
             self.response_limits = clamp_response_limits(payload.get("response_limits"))
         self.prompt_overrides = set_prompt_overrides(overrides)
@@ -1198,6 +1447,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "btn.summary",
             "btn.memory",
             "btn.scene_prompt",
+            "btn.scene_image",
+            "btn.gallery",
             "btn.prompt",
             "btn.world_files",
             "btn.cards",
@@ -1262,6 +1513,22 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "dialog.memory_top_k",
             "dialog.image_style",
             "dialog.image_look",
+            "dialog.section_image",
+            "dialog.image_backend",
+            "image_backend.off",
+            "image_backend.comfy",
+            "image_backend.a1111",
+            "dialog.comfy_url",
+            "dialog.a1111_url",
+            "dialog.comfy_workflow",
+            "dialog.workflow_empty",
+            "dialog.workflow_hint",
+            "dialog.image_width",
+            "dialog.image_height",
+            "dialog.image_steps",
+            "dialog.image_auto",
+            "dialog.image_send_negative",
+            "dialog.image_test",
             "dialog.response_limit",
             "image_style.sd",
             "image_style.midjourney",
@@ -1307,6 +1574,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "status.memory",
             "status.summary_memory",
             "status.scene_prompt",
+            "status.scene_image",
             "dialog.busy",
             "dialog.no_world",
             "dialog.no_prompt",
@@ -1325,6 +1593,13 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "scene.copied_negative",
             "scene.needs_history",
             "scene.needs_world",
+            "scene.needs_prompt",
+            "scene.image_alt",
+            "gallery.empty",
+            "gallery.delete",
+            "gallery.delete_q",
+            "scene.image_off",
+            "scene.image_test_ok",
         ]
         return {key: self.tr(key) for key in keys}
 
@@ -1366,7 +1641,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         return True
 
     def stop(self):
+        target = self._image_target
         stopped = self.request_stop()
+        if target and IMAGE in stopped:
+            image_gen.interrupt(target.get("backend"), target.get("url"))
         if stopped:
             self.add_system_message(self.tr("msg.stop_requested"))
             self.refresh_busy_state()
@@ -1554,6 +1832,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             raise FileExistsError(cleaned)
         files = read_world_archive(payload)
         world_path.mkdir(parents=True)
+        self._ensure_image_library(world_path)
         try:
             for filename, data in files.items():
                 (world_path / filename).write_bytes(data)
@@ -1590,6 +1869,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         intro = str(content.get(INTRODUCTION_FILE, "")).strip()
         initial = [format_introduction_history(intro)] if intro else []
         save_history(world_path, initial)
+        self._ensure_image_library(world_path)
         self.load_world(cleaned)
         return cleaned
 

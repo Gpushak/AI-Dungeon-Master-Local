@@ -12,6 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from dungeon.config import ensure_workflows_dir, list_workflow_files
 from dungeon.storage import CorruptedDataError
 from web.netbind import default_route_ipv4, network_addresses
 from web.session import GameSession
@@ -52,6 +53,7 @@ def local_ipv4s():
 
 
 def create_app(session: GameSession | None = None, bind_host: str = "127.0.0.1") -> FastAPI:
+    ensure_workflows_dir()
     app = FastAPI(title="AIDM Web")
 
     @app.middleware("http")
@@ -378,5 +380,60 @@ def create_app(session: GameSession | None = None, bind_host: str = "127.0.0.1")
     @app.put("/api/scene/options")
     def scene_options(payload: dict):
         return game().set_scene_options(payload.get("image_prompt_style"), payload.get("image_look"))
+
+    @app.put("/api/scene/text")
+    def scene_text(payload: dict):
+        if not game().current_world_path:
+            raise HTTPException(409, "no world")
+        return game().update_scene_text(payload.get("prompt", ""), payload.get("negative", ""))
+
+    @app.get("/api/workflows")
+    def workflows():
+        return {"workflows": list_workflow_files()}
+
+    @app.get("/api/images")
+    def images():
+        if not game().current_world_path:
+            raise HTTPException(409, "no world")
+        return game().image_library_view()
+
+    @app.delete("/api/images/{name}")
+    def delete_image(name: str):
+        if not game().current_world_path:
+            raise HTTPException(409, "no world")
+        if not game().delete_scene_image(name):
+            raise HTTPException(status_code=404, detail="missing")
+        return game().image_library_view()
+
+    @app.post("/api/scene/image")
+    def scene_image_start(payload: dict | None = Body(default=None)):
+        if not game().current_world_path or game().is_busy():
+            raise HTTPException(409, "busy or no world")
+        if isinstance(payload, dict) and ("prompt" in payload or "negative" in payload):
+            game().update_scene_text(payload.get("prompt", ""), payload.get("negative", ""))
+        started = game().start_scene_image()
+        if started:
+            return {"ok": True, "notice": ""}
+        if game().is_busy():
+            raise HTTPException(409, "busy or no world")
+        notice = game().notices[-1] if game().notices else ""
+        return {"ok": False, "notice": notice}
+
+    @app.get("/api/scene/image")
+    def scene_image(name: str | None = None):
+        path = game().scene_image_path(name)
+        if path is None:
+            raise HTTPException(status_code=404)
+        media = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(path.suffix.lower(), "application/octet-stream")
+        return FileResponse(path, media_type=media)
+
+    @app.post("/api/image/test")
+    def image_test(payload: dict | None = Body(default=None)):
+        return game().test_image_connection(payload)
 
     return app

@@ -1,6 +1,7 @@
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .i18n import default_templates
 
@@ -49,6 +50,111 @@ def clamp_response_limits(raw):
 def response_token_limit(limits, key) -> int:
     """Лимит ответа для одного промпта. Неизвестный ключ остаётся на своём встроенном значении."""
     return clamp_response_limits(limits).get(key, DEFAULT_RESPONSE_LIMITS.get(key, 300))
+
+
+# Куда отправлять уже готовый промпт сцены. off — только текст, без генератора.
+IMAGE_BACKENDS = ("off", "comfy", "a1111")
+DEFAULT_IMAGE_BACKEND = "off"
+DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
+DEFAULT_A1111_URL = "http://127.0.0.1:7860"
+DEFAULT_COMFY_WORKFLOW = "scene_api.json"
+# None — папка workflows рядом с worlds. Тесты подменяют каталог.
+WORKFLOWS_DIR = None
+_WORKFLOW_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.json$")
+DEFAULT_IMAGE_WIDTH = 1024
+DEFAULT_IMAGE_HEIGHT = 1024
+DEFAULT_IMAGE_STEPS = 28
+
+
+def normalize_http_url(value, default):
+    """Оставляет http(s)-адрес без хвостового слэша. Пустое и чужое — запасной адрес."""
+    text = str(value or "").strip()
+    if not text:
+        return default
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return default
+    return text.rstrip("/")
+
+
+def normalize_workflow_name(value):
+    """Только имя JSON в папке workflows. Старый путь workflows/scene_api.json сжимается до имени."""
+    text = str(value or "").strip().replace("\\", "/")
+    name = text.rsplit("/", 1)[-1] if text else ""
+    if not _WORKFLOW_NAME.fullmatch(name):
+        return DEFAULT_COMFY_WORKFLOW
+    return name
+
+
+def workflows_dir():
+    """Папка workflow рядом с worlds: в исходниках — корень проекта, у exe — папка программы."""
+    if WORKFLOWS_DIR:
+        return Path(WORKFLOWS_DIR)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "workflows"
+    return PROJECT_ROOT / "workflows"
+
+
+def ensure_workflows_dir():
+    folder = workflows_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def list_workflow_files():
+    folder = ensure_workflows_dir()
+    names = []
+    for path in folder.iterdir():
+        if path.is_file() and _WORKFLOW_NAME.fullmatch(path.name):
+            names.append(path.name)
+    return sorted(names)
+
+
+def clamp_image_side(value, default):
+    """Сторона кадра для Automatic1111: 64–4096 и кратна 8."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    number = min(4096, max(64, number))
+    snapped = number - (number % 8)
+    return snapped if snapped >= 64 else 64
+
+
+def clamp_image_steps(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = DEFAULT_IMAGE_STEPS
+    return min(150, max(1, number))
+
+
+def normalize_image_settings(raw):
+    """Полный набор полей генератора. Неизвестное значение бэкенда выключает отправку."""
+    source = raw if isinstance(raw, dict) else {}
+    backend = source.get("image_backend", DEFAULT_IMAGE_BACKEND)
+    if backend not in IMAGE_BACKENDS:
+        backend = DEFAULT_IMAGE_BACKEND
+    return {
+        "image_backend": backend,
+        "comfy_url": normalize_http_url(source.get("comfy_url"), DEFAULT_COMFY_URL),
+        "a1111_url": normalize_http_url(source.get("a1111_url"), DEFAULT_A1111_URL),
+        "comfy_workflow": normalize_workflow_name(source.get("comfy_workflow")),
+        "image_width": clamp_image_side(source.get("image_width"), DEFAULT_IMAGE_WIDTH),
+        "image_height": clamp_image_side(source.get("image_height"), DEFAULT_IMAGE_HEIGHT),
+        "image_steps": clamp_image_steps(source.get("image_steps")),
+        "image_auto": bool(source.get("image_auto", False)),
+        "image_send_negative": bool(source.get("image_send_negative", True)),
+    }
+
+
+def resolve_workflow_path(raw):
+    """Файл только внутри папки workflows. Каталоги из настройки отбрасываются."""
+    folder = ensure_workflows_dir().resolve()
+    path = (folder / normalize_workflow_name(raw)).resolve()
+    if path.parent != folder:
+        return folder / DEFAULT_COMFY_WORKFLOW
+    return path
 
 
 def apply_image_look(prompt, look):

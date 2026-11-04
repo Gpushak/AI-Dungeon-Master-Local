@@ -11,6 +11,7 @@ from .config import (
     STORY_CARDS_KEY,
     WINDOW_SIZE,
     clamp_response_limits,
+    normalize_image_settings,
 )
 
 from .i18n import (
@@ -66,6 +67,16 @@ class DungeonApp(DialogMixin, AIEngineMixin, ChatMixin, SessionMixin):
         self.image_look = settings.get("image_look", DEFAULT_IMAGE_LOOK)
         if self.image_look not in IMAGE_LOOKS:
             self.image_look = DEFAULT_IMAGE_LOOK
+        image_settings = normalize_image_settings(settings)
+        self.image_backend = image_settings["image_backend"]
+        self.comfy_url = image_settings["comfy_url"]
+        self.a1111_url = image_settings["a1111_url"]
+        self.comfy_workflow = image_settings["comfy_workflow"]
+        self.image_width = image_settings["image_width"]
+        self.image_height = image_settings["image_height"]
+        self.image_steps = image_settings["image_steps"]
+        self.image_auto = image_settings["image_auto"]
+        self.image_send_negative = image_settings["image_send_negative"]
         self.response_limits = clamp_response_limits(settings.get("response_limits"))
         self.covered_count = 0
         self.context_ratio = 0.0
@@ -156,6 +167,15 @@ class DungeonApp(DialogMixin, AIEngineMixin, ChatMixin, SessionMixin):
                 "memory_enabled": self.memory_enabled,
                 "image_prompt_style": self.image_prompt_style,
                 "image_look": self.image_look,
+                "image_backend": self.image_backend,
+                "comfy_url": self.comfy_url,
+                "a1111_url": self.a1111_url,
+                "comfy_workflow": self.comfy_workflow,
+                "image_width": self.image_width,
+                "image_height": self.image_height,
+                "image_steps": self.image_steps,
+                "image_auto": self.image_auto,
+                "image_send_negative": self.image_send_negative,
                 "response_limits": self.response_limits,
                 "language": self.language,
                 "prompt_overrides": self.prompt_overrides,

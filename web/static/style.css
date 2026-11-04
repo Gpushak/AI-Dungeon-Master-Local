@@ -410,6 +410,29 @@ dialog label { display: block; margin: 10px 0 4px; color: var(--muted); font-siz
 .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 .tabs { display: flex; gap: 8px; margin-bottom: 10px; }
 .choice-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.scene-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 8px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
+}
+.gallery button {
+  padding: 0;
+  overflow: hidden;
+}
+.gallery img {
+  display: block;
+  width: 100%;
+  height: 120px;
+  object-fit: cover;
+}
 .choice-row button[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); }
 .tabs button[aria-pressed="true"], .file-buttons button[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); }
 .file-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
