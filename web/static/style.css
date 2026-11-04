@@ -49,13 +49,18 @@ body {
 #menu-toggle, #act { display: none; }
 
 .top-actions {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 8px 24px 0;
+  min-width: 0;
 }
 
-.models, .modes { position: relative; }
+/* Меню моделей крепится к полосе, а не к кнопке: «Режимы» справа от неё
+   сдвигали выпадающий список за край экрана. */
+.models { position: static; min-width: 0; }
+.modes { position: relative; min-width: 0; flex: 0 1 auto; }
 .models.open #models-toggle,
 .modes.open #modes-toggle,
 .worlds-picker.open #world-toggle { border-color: var(--gold); color: var(--gold); }
@@ -64,7 +69,20 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  max-width: min(280px, 70vw);
+  max-width: min(280px, 100%);
+  min-width: 0;
+}
+
+.models .pop {
+  left: 24px;
+  right: auto;
+  min-width: min(220px, calc(100% - 24px));
+  max-width: min(320px, calc(100% - 24px));
+}
+
+.modes .pop {
+  left: auto;
+  right: 0;
 }
 
 #models-current, #modes-current {
@@ -440,7 +458,12 @@ dialog label { display: block; margin: 10px 0 4px; color: var(--muted); font-siz
   .top-actions { padding: 8px 12px 0; min-width: 0; }
   .models { flex: 1 1 auto; min-width: 0; }
   #models-toggle { max-width: 100%; }
-  .models .pop, .worlds-picker .pop { left: auto; right: 0; }
+  .models .pop {
+    left: 12px;
+    min-width: min(220px, calc(100% - 24px));
+    max-width: min(320px, calc(100% - 24px));
+  }
+  .worlds-picker .pop { left: auto; right: 0; }
   #menu-toggle {
     display: inline-flex;
     align-items: center;

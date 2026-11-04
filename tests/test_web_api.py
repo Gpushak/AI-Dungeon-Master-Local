@@ -453,7 +453,7 @@ def test_state_is_not_cached():
         page = client.get("/")
         assert "no-store" in page.headers.get("cache-control", "")
         assert "app.js?v=15" in page.text
-        assert "style.css?v=15" in page.text
+        assert "style.css?v=16" in page.text
         assert 'rel="icon"' in page.text
         icon = client.get("/favicon.ico")
         assert icon.status_code == 200
