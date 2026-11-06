@@ -44,6 +44,29 @@ function plainText(value) {
     .replace(/^ +/, "");
 }
 
+function setNodeText(node, value) {
+  const text = String(value ?? "");
+  node.replaceChildren(document.createTextNode(text));
+  return node;
+}
+
+function keyStatusText(source) {
+  const data = source || settingsCache || {};
+  if (!data.api_key_set) return "";
+  const tail = data.api_key_last4 ? ` ····${data.api_key_last4}` : "";
+  const language = String(data.language || (state && state.language) || "ru").toLowerCase();
+  return language.startsWith("en")
+    ? `A key is already saved${tail}.`
+    : `Ключ уже задан${tail}.`;
+}
+
+function paintStoredKeyNote(source) {
+  const note = document.querySelector("[data-key-note]");
+  if (!note) return;
+  const text = keyStatusText(source);
+  setNodeText(note, text ? ` ${text}` : "");
+}
+
 function unixText(value) {
   return String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
@@ -224,7 +247,7 @@ function renderLog(mode = "end", draftOverride) {
     const p = document.createElement("p");
     p.className = row.kind;
     p.dataset.index = String(row.index);
-    p.textContent = plainText(row.text);
+    setNodeText(p, plainText(row.text));
     if (row.kind === "player" || row.kind === "dm") {
       p.tabIndex = 0;
       p.setAttribute("role", "button");
@@ -244,7 +267,7 @@ function renderLog(mode = "end", draftOverride) {
     const p = document.createElement("p");
     p.className = "dm draft";
     p.id = "draft";
-    p.textContent = draftText;
+    setNodeText(p, draftText);
     logEl.appendChild(p);
   }
   if (mode === "keep") {
@@ -295,7 +318,7 @@ function paintModels() {
   const current = document.querySelector("#models-current");
   const presets = (state && state.presets) || { active: "", items: [] };
   const active = (presets.items || []).find((item) => item.name === presets.active);
-  current.textContent = active ? active.name : "";
+  setNodeText(current, active ? active.name : "");
   current.hidden = !active;
   menu.replaceChildren();
   if (!(presets.items || []).length) {
@@ -311,7 +334,7 @@ function paintModels() {
     button.setAttribute("role", "menuitemradio");
     button.setAttribute("aria-checked", item.name === presets.active ? "true" : "false");
     const name = document.createElement("span");
-    name.textContent = item.name;
+    setNodeText(name, item.name);
     button.append(name);
     if (item.model) {
       const model = document.createElement("small");
@@ -339,14 +362,19 @@ async function selectPreset(name) {
     if (!found) return;
     settingsCache.active_api_preset = found.name;
     settingsCache.api_url = found.api_url || "";
-    settingsCache.api_key = found.api_key || "";
+    settingsCache.api_key = "";
+    settingsCache.api_key_set = Boolean(found.api_key_set);
+    settingsCache.api_key_last4 = found.api_key_last4 || "";
     settingsCache.model = found.model || "";
     const preset = document.querySelector("#settings-preset");
     if (preset) preset.value = found.name;
-    for (const key of ["api_url", "api_key", "model"]) {
+    for (const key of ["api_url", "model"]) {
       const input = document.querySelector(`[data-setting="${key}"]`);
       if (input) input.value = settingsCache[key];
     }
+    const keyInput = document.querySelector('[data-setting="api_key"]');
+    if (keyInput) keyInput.value = "";
+    paintStoredKeyNote();
   } catch (error) {
     failNotice(error);
   }
@@ -389,7 +417,7 @@ function paintWorlds() {
   current.replaceChildren();
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = active || t("no_worlds");
+  setNodeText(name, active || t("no_worlds"));
   current.append(name);
   if (activeItem) appendLangMark(current, activeItem.language);
   menu.replaceChildren();
@@ -416,7 +444,7 @@ function paintWorlds() {
     button.setAttribute("role", "menuitemradio");
     button.setAttribute("aria-checked", item.name === active ? "true" : "false");
     const title = document.createElement("span");
-    title.textContent = item.name;
+    setNodeText(title, item.name);
     button.append(title);
     appendLangMark(button, item.language);
     button.addEventListener("click", () => openWorld(item.name));
@@ -731,7 +759,7 @@ function connectEvents() {
       if (!draft) return;
       const next = typeof event.full === "string" ? event.full : `${draft.textContent}${event.text || ""}`;
       if (next.length >= draft.textContent.length) {
-        draft.textContent = next;
+        setNodeText(draft, next);
         if (state) {
           state.streaming = true;
           state.draft = next;
@@ -1072,7 +1100,7 @@ function openEditor(index) {
   let pos = rows.findIndex((row) => row.index === index);
   if (pos < 0) pos = rows.length - 1;
   if (pos < 0) return;
-  panelBody.innerHTML = "";
+  panelBody.replaceChildren();
   const heading = document.createElement("p");
   heading.className = "section";
   const label = document.createElement("label");
@@ -1146,7 +1174,7 @@ function openPanel(name, extra) {
   panel.dataset.panel = name;
   applyCardDescription = null;
   panelTitle.textContent = t(`btn.${name === "settings" ? "ai_settings" : name === "files" ? "world_files" : name === "scene" ? "scene_prompt" : name}`);
-  panelBody.innerHTML = "";
+  panelBody.replaceChildren();
   const loaders = { worlds: renderWorlds, files: renderFiles, cards: renderCards, memory: renderMemory, settings: renderSettings, prompt: renderPrompt, scene: renderScene, gallery: renderGallery };
   loaders[name](extra);
   if (!panel.open) panel.showModal();
@@ -1233,11 +1261,11 @@ function mountCardEditor(host, cardsData, options) {
   }
 
   function draw() {
-    list.innerHTML = "";
+    list.replaceChildren();
     for (const item of visible()) {
       const button = document.createElement("button");
       button.type = "button";
-      button.textContent = item.card.title || t("cards.untitled");
+      setNodeText(button, item.card.title || t("cards.untitled"));
       button.setAttribute("aria-pressed", item.index === current ? "true" : "false");
       button.addEventListener("click", () => {
         read();
@@ -1349,7 +1377,7 @@ function mountCardEditor(host, cardsData, options) {
 
 async function renderWorlds() {
   panelTitle.textContent = t("btn.worlds");
-  panelBody.innerHTML = "";
+  panelBody.replaceChildren();
   const data = await api("/api/worlds");
   const items = worldItems(data.worlds);
   let selected = data.current || (items[0] && items[0].name) || "";
@@ -1373,7 +1401,7 @@ async function renderWorlds() {
       const button = document.createElement("button");
       button.type = "button";
       const title = document.createElement("span");
-      title.textContent = item.name;
+      setNodeText(title, item.name);
       button.append(title);
       appendLangMark(button, item.language);
       button.setAttribute("aria-pressed", item.name === selected ? "true" : "false");
@@ -1486,7 +1514,7 @@ async function renderCreateWorld() {
     return;
   }
   panelTitle.textContent = t("dialog.create_world");
-  panelBody.innerHTML = "";
+  panelBody.replaceChildren();
   const error = document.createElement("p");
   error.className = "error";
   const nameLabel = document.createElement("label");
@@ -1515,7 +1543,7 @@ async function renderCreateWorld() {
     const button = document.createElement("button");
     button.type = "button";
     button.dataset.file = file;
-    button.textContent = t(`world_file.${file}`);
+    setNodeText(button, t(`world_file.${file}`));
     button.addEventListener("click", () => show(file));
     buttons.append(button);
   }
@@ -1588,7 +1616,7 @@ async function renderFiles() {
     const button = document.createElement("button");
     button.type = "button";
     button.dataset.file = name;
-    button.textContent = t(`world_file.${name}`);
+    setNodeText(button, t(`world_file.${name}`));
     button.addEventListener("click", () => show(name));
     buttons.append(button);
   }
@@ -1975,7 +2003,7 @@ function paintSettingsForm(preferredTab) {
     ["prompts", "dialog.tab_prompts"],
   ];
   function show(which) {
-    body.innerHTML = "";
+    body.replaceChildren();
     tabs.querySelectorAll("button").forEach((button) => button.setAttribute("aria-pressed", button.dataset.tab === which ? "true" : "false"));
     if (which === "ai") body.append(aiFields());
     else if (which === "game") body.append(gameFields());
@@ -2134,19 +2162,40 @@ function paintSettingsForm(preferredTab) {
     const known = [...preset.options].some((option) => option.value === (settingsCache.active_api_preset || ""));
     preset.value = known ? (settingsCache.active_api_preset || "") : "";
     const url = field(t("dialog.api_url"), "api_url");
-    const key = field(t("dialog.api_key"), "api_key", { type: "password" });
+    const key = document.createElement("label");
+    const keyCaption = document.createElement("span");
+    keyCaption.append(document.createTextNode(t("dialog.api_key")));
+    const keyNote = document.createElement("span");
+    keyNote.dataset.keyNote = "1";
+    keyCaption.append(keyNote);
+    const keyInput = document.createElement("input");
+    keyInput.type = "password";
+    keyInput.value = "";
+    keyInput.autocomplete = "new-password";
+    keyInput.dataset.setting = "api_key";
+    settingsCache.api_key = "";
+    keyInput.addEventListener("input", () => { settingsCache.api_key = keyInput.value; });
+    key.append(keyCaption, keyInput);
+    setNodeText(keyNote, keyStatusText() ? ` ${keyStatusText()}` : "");
     const model = field(t("dialog.model"), "model");
-    const keyInput = key.querySelector("input");
     preset.addEventListener("change", () => {
       settingsCache.active_api_preset = preset.value;
+      settingsCache.api_key = "";
+      keyInput.value = "";
       const found = (settingsCache.api_presets || []).find((item) => item.name === preset.value);
-      if (!found) return;
+      if (!found) {
+        settingsCache.api_key_set = false;
+        settingsCache.api_key_last4 = "";
+        paintStoredKeyNote();
+        return;
+      }
       settingsCache.api_url = found.api_url || "";
-      settingsCache.api_key = found.api_key || "";
+      settingsCache.api_key_set = Boolean(found.api_key_set);
+      settingsCache.api_key_last4 = found.api_key_last4 || "";
       settingsCache.model = found.model || "";
       url.querySelector("input").value = settingsCache.api_url;
-      keyInput.value = settingsCache.api_key;
       model.querySelector("input").value = settingsCache.model;
+      paintStoredKeyNote();
     });
     const showKey = check(t("dialog.show_key"), "show_api_key");
     showKey.querySelector("input").checked = false;
