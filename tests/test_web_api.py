@@ -700,7 +700,11 @@ def test_preset_switch_updates_connection():
         settings = client.get("/api/settings").json()
         assert settings["model"] == "other"
         assert settings["api_url"] == "http://example.test/v1/chat/completions"
-        assert settings["api_key"] == "secret"
+        assert "secret" not in json.dumps(settings)
+        assert "api_key" not in settings
+        assert settings["api_key_set"] is True
+        assert settings["api_key_last4"] == "cret"
+        assert json.loads((tmp / "settings.json").read_text(encoding="utf-8"))["api_key"] == "secret"
         assert settings["active_api_preset"] == "Remote"
         missing = client.post("/api/presets/activate", json={"name": "Nope"})
         assert missing.status_code == 404
@@ -1115,6 +1119,226 @@ def test_world_guards_settings_and_startup():
         assert state["memory"]["entries"] == []
         assert client.post("/api/summary").status_code == 409
     print("OK  чужие пути закрыты, битый мир не роняет сервер, ход блокирует правки")
+
+
+def _js_function(source, name):
+    marker = f"function {name}"
+    start = source.index(marker)
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(name)
+
+
+def test_markup_stays_text():
+    import tempfile
+
+    markup = "<script>alert(1)</script><button>click</button>"
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        _use_tmp(tmp)
+        client = TestClient(create_app())
+        assert client.post("/api/worlds", json={"name": "Camp"}).status_code == 200
+        history = [f"Мастер: {markup}", f"Игрок: {markup}"]
+        (tmp / "Camp" / "history.json").write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+        cards = {"cards": [{"id": "card_001", "title": markup, "description": markup, "triggers": [markup]}]}
+        (tmp / "Camp" / "story_cards.json").write_text(json.dumps(cards, ensure_ascii=False), encoding="utf-8")
+        opened = client.post("/api/worlds/open", json={"name": "Camp"})
+        assert opened.status_code == 200, opened.text
+        state = opened.json()
+        texts = [row["text"] for row in state["history"]]
+        assert markup in texts
+        listed = client.get("/api/cards").json()
+        assert listed["cards"][0]["title"] == markup
+        assert listed["cards"][0]["description"] == markup
+        assert listed["cards"][0]["triggers"] == [markup]
+        raw = client.get("/api/state").text
+        assert markup in raw
+        assert raw.lstrip().startswith("{")
+
+        page = client.get("/")
+        api = client.get("/api/state")
+        for response in (page, api):
+            policy = response.headers["content-security-policy"]
+            assert "script-src 'self'" in policy
+            assert "style-src 'self'" in policy
+            assert "unsafe-inline" not in policy
+            assert "*" not in policy
+
+    source = (ROOT / "web" / "static" / "app.js").read_text(encoding="utf-8")
+    log_source = _js_function(source, "renderLog")
+    assert "innerHTML" not in log_source
+    assert "setNodeText(p, plainText(row.text))" in log_source
+    assert ".innerHTML" not in source
+    setter = _js_function(source, "setNodeText")
+    script = r"""
+const fs = require("fs");
+const setter = fs.readFileSync(0, "utf8");
+class TextNode {
+  constructor(text) { this.nodeType = 3; this.nodeValue = String(text); }
+  get textContent() { return this.nodeValue; }
+}
+class Element {
+  constructor() { this.nodeType = 1; this.childNodes = []; }
+  get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
+  get textContent() { return this.childNodes.map((node) => node.textContent).join(""); }
+  set textContent(value) { this.replaceChildren(new TextNode(value)); }
+  replaceChildren(...nodes) { this.childNodes = nodes; }
+  set innerHTML(html) {
+    const element = new Element();
+    element.childNodes = [new TextNode(String(html).replace(/<[^>]+>/g, ""))];
+    this.childNodes = [element];
+  }
+}
+const document = { createTextNode: (text) => new TextNode(text) };
+const setNodeText = new Function("document", setter + "\nreturn setNodeText;")(document);
+const markup = "<script>alert(1)</script><button>click</button>";
+const node = new Element();
+setNodeText(node, markup);
+if (node.textContent !== markup || node.children.length !== 0) {
+  console.error(JSON.stringify({ text: node.textContent, children: node.children.length }));
+  process.exit(1);
+}
+"""
+    import subprocess
+
+    checked = subprocess.run(["node", "-e", script], input=setter, text=True, capture_output=True, check=False)
+    assert checked.returncode == 0, checked.stderr or checked.stdout
+    print("OK  чужой текст остаётся строкой, страница не берёт скрипты с других сайтов")
+
+
+def test_world_paths_and_hidden_key():
+    import io
+    import shutil
+    import tempfile
+    import zipfile
+
+    secret = "sk-test-DoNotLeak-4491"
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        _use_tmp(tmp)
+        client = TestClient(create_app())
+        assert client.post("/api/worlds", json={"name": "Camp"}).status_code == 200
+        outside = Path(tempfile.mkdtemp())
+        try:
+            assert client.post("/api/worlds/open", json={"name": ".."}).status_code == 400
+            assert client.post("/api/worlds/open", json={"name": "../Camp"}).status_code == 400
+            assert client.post("/api/worlds/open", json={"name": str(outside)}).status_code == 400
+            assert client.post("/api/worlds/open", json={"name": "/etc"}).status_code == 400
+            link = tmp / "Linked"
+            link.symlink_to(outside, target_is_directory=True)
+            assert client.post("/api/worlds/open", json={"name": "Linked"}).status_code == 400
+            assert client.delete("/api/worlds/Linked").status_code == 400
+            assert outside.is_dir()
+
+            leak = outside / "leak.txt"
+            leak.write_text("OUTSIDE_FILE_SECRET", encoding="utf-8")
+            plot = tmp / "Camp" / "plot_basics.txt"
+            plot.unlink()
+            plot.symlink_to(leak)
+            files = client.get("/api/files")
+            assert files.status_code == 200, files.text
+            assert files.json()["plot_basics.txt"] == ""
+            assert "OUTSIDE_FILE_SECRET" not in files.text
+            exported = client.get("/api/worlds/Camp/export")
+            assert exported.status_code == 200, exported.text
+            with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+                names = set(archive.namelist())
+                blob = b"\n".join(archive.read(name) for name in names)
+            assert "plot_basics.txt" not in names
+            assert b"OUTSIDE_FILE_SECRET" not in blob
+
+            (outside / "history.json").write_text(
+                json.dumps(["Мастер: OUTSIDE_HISTORY_SECRET"], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            history_path = tmp / "Camp" / "history.json"
+            history_path.unlink()
+            history_path.symlink_to(outside / "history.json")
+            opened = client.post("/api/worlds/open", json={"name": "Camp"})
+            assert opened.status_code == 200, opened.text
+            assert "OUTSIDE_HISTORY_SECRET" not in opened.text
+            assert leak.read_text(encoding="utf-8") == "OUTSIDE_FILE_SECRET"
+
+            slipped = io.BytesIO()
+            with zipfile.ZipFile(slipped, "w") as archive:
+                archive.writestr("../settings.json", "ZIP_TRAVERSAL_SECRET")
+                archive.writestr("history.json", "[]")
+            rejected = client.post(
+                "/api/worlds/import?name=Escape",
+                content=slipped.getvalue(),
+                headers={"Content-Type": "application/zip"},
+            )
+            assert rejected.status_code == 400
+            assert not (tmp / "Escape").exists()
+            if (tmp / "settings.json").exists():
+                assert "ZIP_TRAVERSAL_SECRET" not in (tmp / "settings.json").read_text(encoding="utf-8")
+
+            saved = client.put(
+                "/api/settings",
+                json={
+                    "api_key": secret,
+                    "temperature": 0.5,
+                    "active_api_preset": "Hidden",
+                    "api_presets": [
+                        {
+                            "name": "Hidden",
+                            "api_url": "http://example.test/v1/chat/completions",
+                            "api_key": secret,
+                            "model": "hidden",
+                        }
+                    ],
+                },
+            )
+            assert saved.status_code == 200, saved.text
+            assert secret not in saved.text
+            body = saved.json()
+            assert "api_key" not in body
+            assert body["api_key_set"] is True
+            assert body["api_key_last4"] == "4491"
+            assert "api_key" not in body["api_presets"][0]
+            assert body["api_presets"][0]["api_key_set"] is True
+            kept = client.put(
+                "/api/settings",
+                json={
+                    "api_key": "",
+                    "temperature": 0.4,
+                    "api_presets": [
+                        {
+                            "name": "Hidden",
+                            "api_url": "http://example.test/v1/chat/completions",
+                            "api_key": "",
+                            "model": "hidden",
+                        }
+                    ],
+                },
+            )
+            assert kept.status_code == 200, kept.text
+            assert kept.json()["temperature"] == 0.4
+            assert secret not in kept.text
+            stored = json.loads((tmp / "settings.json").read_text(encoding="utf-8"))
+            assert stored["api_key"] == secret
+            assert stored["api_presets"][0]["api_key"] == secret
+            assert secret not in client.get("/api/settings").text
+            assert secret not in client.get("/api/state").text
+            assert secret not in client.get("/api/prompt").text
+            packed = client.get("/api/worlds/Camp/export")
+            assert packed.status_code == 200, packed.text
+            assert secret.encode() not in packed.content
+            replaced = client.put("/api/settings", json={"api_key": "sk-test-Replacement-0009"})
+            assert replaced.status_code == 200, replaced.text
+            assert "sk-test-Replacement-0009" not in replaced.text
+            assert json.loads((tmp / "settings.json").read_text(encoding="utf-8"))["api_key"] == "sk-test-Replacement-0009"
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+    print("OK  чужие пути и сохранённый ключ не выходят через веб-API")
 
 
 def test_overlapping_jobs_start_once():
@@ -2066,6 +2290,8 @@ if __name__ == "__main__":
     test_world_language_marks_and_english_token_scale()
     test_prompt_limits_and_scene_look()
     test_world_guards_settings_and_startup()
+    test_markup_stays_text()
+    test_world_paths_and_hidden_key()
     test_overlapping_jobs_start_once()
     test_modes_keep_worlds_in_separate_folders()
     test_d20_discards_unknown_difficulty_and_uses_a_known_roll()

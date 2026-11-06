@@ -30,6 +30,19 @@ def _static_dir():
 
 STATIC_DIR = _static_dir()
 WEB_PORT = 8765
+# Скрипты и стили только со своего адреса: чужой сайт не может вставить разметку.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self'; "
+    "img-src 'self'; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'; "
+    "form-action 'self'"
+)
 
 
 def app_icon_path():
@@ -64,6 +77,7 @@ def create_app(session: GameSession | None = None, bind_host: str = "127.0.0.1")
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+        response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
         return response
 
     app.state.session = session or GameSession()

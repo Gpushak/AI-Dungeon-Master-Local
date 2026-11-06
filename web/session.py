@@ -44,6 +44,7 @@ from dungeon.i18n import (
     intro_text,
     is_intro_msg,
     is_player_msg,
+    localize_history,
     normalize_lang,
     player_text,
     prompt_edit_issues,
@@ -52,12 +53,20 @@ from dungeon.i18n import (
 )
 from dungeon.memory import (
     count_completed_turns,
+    format_memory_block,
     get_recent_turn_messages,
     load_memory_bank,
+    retrieve_relevant_memories,
     save_memory_bank,
     sync_memory_bank_after_undo,
 )
-from dungeon.story_cards import default_story_cards, load_story_cards, save_story_cards
+from dungeon.story_cards import (
+    default_story_cards,
+    format_story_cards_block,
+    load_story_cards,
+    retrieve_relevant_cards,
+    save_story_cards,
+)
 from dungeon.tokens import (
     count_tokens,
     counter_kind,
@@ -65,6 +74,7 @@ from dungeon.tokens import (
     model_scale_observed,
     model_token_scale,
     set_model_token_scale,
+    summary_needs_compression,
 )
 from dungeon.storage import (
     ADVENTURE_DIR,
@@ -174,6 +184,46 @@ def world_directory(name, root=None):
     if world_path.parent != base:
         raise ValueError("bad name")
     return cleaned, world_path
+
+
+def world_file_text(world_path, name):
+    """Текст файла внутри папки мира. Симлинк на другой файл не читаем."""
+    if not world_path:
+        return ""
+    path = Path(world_path) / name
+    if path.is_symlink() or not path.is_file():
+        return ""
+    try:
+        if path.resolve().parent != Path(world_path).resolve():
+            return ""
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _linked_file(path):
+    """Файл или его запасная копия — ссылка, а не обычный файл мира."""
+    path = Path(path)
+    if path.is_symlink():
+        return True
+    backup = path.with_name(path.name + ".bak")
+    return not path.exists() and backup.is_symlink()
+
+
+def _detach_symlink(path):
+    """Убирает ссылку перед записью, чтобы не скопировать чужой файл в .bak."""
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+
+
+def public_key_fields(value):
+    """Признак сохранённого ключа без самого секрета."""
+    text = str(value or "")
+    return {
+        "api_key_set": bool(text),
+        "api_key_last4": text[-4:] if len(text) > 4 else "",
+    }
 
 
 def allowed_world_filename(name):
@@ -412,11 +462,70 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             return self.state_view()
 
     def _static_context_text(self, retrieval_query):
-        """Веб-обёртка: карточка героя всегда в промпте и не ищется среди story_cards."""
-        context = super()._static_context_text(retrieval_query)
+        """Текст мира в промпте — обычная строка. Симлинк на файл снаружи не читается."""
+        context = ""
+        if self.current_world_path:
+            for fname in WORLD_FILES:
+                if fname in ("summary.txt", INTRODUCTION_FILE):
+                    continue
+                content = world_file_text(self.current_world_path, fname).strip()
+                if content:
+                    context += f"=== {fname} ===\n{content}\n"
+            summary_content = world_file_text(self.current_world_path, "summary.txt").strip()
+            if summary_content:
+                context += t(self.language, "prompt.summary_header", text=summary_content)
+            if self.memory_enabled:
+                relevant_memories = retrieve_relevant_memories(
+                    retrieval_query, self.memory_bank, top_k=self.memory_top_k
+                )
+                memory_block = format_memory_block(relevant_memories, self.language)
+                if memory_block:
+                    context += memory_block
+            relevant_cards = retrieve_relevant_cards(
+                retrieval_query, self.story_cards, top_k=self.memory_top_k
+            )
+            cards_block = format_story_cards_block(relevant_cards, self.language)
+            if cards_block:
+                context += cards_block
         if self.hero_enabled():
             context += adventure_rules.format_hero_block(self.hero, self.language)
         return context
+
+    def _scene_context(self):
+        """Сцена берёт файлы мира как текст и пропускает симлинк на чужой файл."""
+        world_path = self.current_world_path
+        plot_basics = ""
+        for fname in ("plot_basics.txt", "ai_instructions.txt", "author_notes.txt"):
+            content = world_file_text(world_path, fname).strip()
+            if content:
+                plot_basics += f"=== {fname} ===\n{content}\n"
+        recent = get_recent_turn_messages(self.history, SCENE_TURNS)
+        history_fragment = "\n".join(localize_history(self.language, recent))
+        query = "\n".join(recent)
+        cards = retrieve_relevant_cards(query, self.story_cards, top_k=self.memory_top_k)
+        cards_block = format_story_cards_block(cards, self.language)
+        return plot_basics, history_fragment, cards_block
+
+    def _summary_history_budget(self):
+        path = self.current_world_path / "summary.txt" if self.current_world_path else None
+        if path is None or not path.is_symlink():
+            return super()._summary_history_budget()
+        old_summary = t(self.language, "prompt.none")
+        summary_max_tokens = response_token_limit(getattr(self, "response_limits", None), "prompt.summary")
+        compress_note = ""
+        if summary_needs_compression(count_tokens(old_summary), summary_max_tokens):
+            compress_note = "\n\n" + t(self.language, "prompt.summary_compress")
+        prompt_template_base = t(
+            self.language,
+            "prompt.summary",
+            old_summary=old_summary,
+            history="",
+        ) + compress_note
+        safety_buffer = 400
+        available = self.context_size - summary_max_tokens - count_tokens(prompt_template_base) - safety_buffer
+        if available < 800:
+            available = 800
+        return available, old_summary, summary_max_tokens, compress_note
 
     def _ask_json(self, prompt):
         payload = self._api_payload(
@@ -579,7 +688,37 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             or self.cards_running
         )
 
+    def _secret_values(self):
+        found = []
+        candidates = [self.api_key]
+        for item in self.api_presets or []:
+            if isinstance(item, dict):
+                candidates.append(item.get("api_key"))
+        for raw in candidates:
+            text = str(raw or "")
+            if len(text) >= 8 and text not in found:
+                found.append(text)
+        found.sort(key=len, reverse=True)
+        return found
+
+    def _redact_value(self, value):
+        secrets = self._secret_values()
+
+        def scrub(item):
+            if isinstance(item, str):
+                for secret in secrets:
+                    item = item.replace(secret, "••••")
+                return item
+            if isinstance(item, list):
+                return [scrub(part) for part in item]
+            if isinstance(item, dict):
+                return {key: scrub(part) for key, part in item.items()}
+            return item
+
+        return scrub(value)
+
     def add_system_message(self, message):
+        message = self._redact_value(message)
         self.notices = [message] if message else []
         self.emit("system", text=message or "")
 
@@ -1034,7 +1173,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             start = self._fragment_start(total)
         else:
             start = max(0, min(int(start), total))
-        return {
+        view = {
             "world": self.world_name,
             "worlds": self.mode_world_entries(),
             "play_mode": self.play_mode,
@@ -1056,6 +1195,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "cards": self.story_cards,
             "presets": self.presets_view(),
         }
+        return self._redact_value(view)
 
     def meters_view(self):
         entries = len((self.memory_bank or {}).get("entries", []))
@@ -1131,13 +1271,36 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.world_name = cleaned
         self.last_sent_prompt = None
         self.notices = []
-        self.history = ensure_introduction_in_history(world_path, loaded_history)
+        history_path = world_path / "history.json"
+        if _linked_file(history_path):
+            loaded_history = []
+            restored = False
+        if (world_path / INTRODUCTION_FILE).is_symlink():
+            self.history = list(loaded_history)
+        else:
+            self.history = ensure_introduction_in_history(world_path, loaded_history)
         if self.history != loaded_history:
+            _detach_symlink(history_path)
             save_history(world_path, self.history)
         self._load_summary_cursor(loaded_history)
-        self.memory_bank = load_memory_bank(world_path)
-        self.story_cards = load_story_cards(world_path)
-        self.hero = adventure_rules.load_hero(world_path)
+        memory_path = world_path / "memory_bank.json"
+        if _linked_file(memory_path):
+            self.memory_bank = {"last_indexed_turn": 0, "entries": []}
+        else:
+            self.memory_bank = load_memory_bank(world_path)
+        cards_path = world_path / "story_cards.json"
+        characters_path = world_path / "characters.txt"
+        cards_backup = cards_path.with_name(cards_path.name + ".bak")
+        if _linked_file(cards_path) or (
+            not cards_path.exists() and not cards_backup.exists() and characters_path.is_symlink()
+        ):
+            self.story_cards = {"cards": []}
+        else:
+            self.story_cards = load_story_cards(world_path)
+        if _linked_file(world_path / "hero.json"):
+            self.hero = None
+        else:
+            self.hero = adventure_rules.load_hero(world_path)
         self.pending_stats = None
         current_turns = count_completed_turns(self.history)
         self.turns_since_memory = current_turns - self.memory_bank.get("last_indexed_turn", 0)
@@ -1261,12 +1424,20 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                     item["limit"] = self.response_limits.get(key, DEFAULT_RESPONSE_LIMITS[key])
                 prompts.append(item)
             groups.append({"title": self.tr(group_key), "prompts": prompts})
-        return {
+        view = {
             "api_url": self.api_url,
-            "api_key": self.api_key,
+            **public_key_fields(self.api_key),
             "model": self.model,
             "active_api_preset": self.active_api_preset,
-            "api_presets": self.api_presets,
+            "api_presets": [
+                {
+                    "name": item["name"],
+                    "api_url": item.get("api_url") or "",
+                    "model": item.get("model") or "",
+                    **public_key_fields(item.get("api_key")),
+                }
+                for item in self.api_presets
+            ],
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "context_size": self.context_size,
@@ -1295,6 +1466,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "prompts": groups,
             "prompt_overrides": self.prompt_overrides,
         }
+        return self._redact_value(view)
 
     def apply_settings(self, payload):
         with self._job_lock:
@@ -1320,10 +1492,11 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         previous_count_lang = self._count_language()
         self.language = language
         self.api_url = str(payload.get("api_url", self.api_url) or "")
-        self.api_key = str(payload.get("api_key", self.api_key) or "")
         previous_model = self.model
+        previous_active = self.active_api_preset
+        self.api_presets = self._merge_preset_keys(payload.get("api_presets", self.api_presets))
         self.active_api_preset = str(payload.get("active_api_preset", self.active_api_preset) or "")
-        self.api_presets = normalize_api_presets(payload.get("api_presets", self.api_presets))
+        self.api_key = self._next_api_key(payload, previous_active)
         self.temperature = _as_float(payload.get("temperature", self.temperature), self.temperature, 0, 2)
         self.max_tokens = _as_int(payload.get("max_tokens", self.max_tokens), self.max_tokens, 1, 100000)
         self.context_size = _as_int(payload.get("context_size", self.context_size), self.context_size, 1, 2_000_000)
@@ -1376,11 +1549,47 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.refresh_busy_state()
         return []
 
+    def _merge_preset_keys(self, presets):
+        """Пустой ключ пресета не затирает уже сохранённый."""
+        previous = {}
+        for item in self.api_presets:
+            if isinstance(item, dict) and item.get("name"):
+                previous[item["name"]] = str(item.get("api_key") or "")
+        merged = normalize_api_presets(presets)
+        for item in merged:
+            if str(item.get("api_key") or "").strip():
+                continue
+            if item["name"] in previous:
+                item["api_key"] = previous[item["name"]]
+            else:
+                item["api_key"] = str(self.api_key or "")
+        return merged
+
+    def _next_api_key(self, payload, previous_active):
+        """Пустое поле ключа оставляет сохранённый. Новое значение его заменяет."""
+        if "api_key" not in payload or payload.get("api_key") is None:
+            chosen = self.api_key
+            blank = True
+        else:
+            text = str(payload.get("api_key"))
+            blank = not text.strip()
+            chosen = self.api_key if blank else text
+        active = str(payload.get("active_api_preset", previous_active) or "")
+        if blank and active and active != previous_active:
+            found = next((item for item in self.api_presets if item["name"] == active), None)
+            if found is not None:
+                return str(found.get("api_key") or "")
+        return chosen
+
     def presets_view(self):
         return {
             "active": self.active_api_preset or "",
             "items": [
-                {"name": item["name"], "model": item.get("model") or ""}
+                {
+                    "name": item["name"],
+                    "model": item.get("model") or "",
+                    **public_key_fields(item.get("api_key")),
+                }
                 for item in self.api_presets
             ],
         }
@@ -1745,8 +1954,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             return {}
         files = {}
         for fname in WORLD_FILES:
-            path = self.current_world_path / fname
-            files[fname] = path.read_text(encoding="utf-8") if path.exists() else ""
+            files[fname] = world_file_text(self.current_world_path, fname)
         return files
 
     def save_world_file(self, name, content):
@@ -1760,7 +1968,9 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             raise RuntimeError("busy")
         if not isinstance(content, str):
             content = "" if content is None else str(content)
-        atomic_write_text(self.current_world_path / name, content)
+        target = self.current_world_path / name
+        _detach_symlink(target)
+        atomic_write_text(target, content)
         if name == INTRODUCTION_FILE:
             self.sync_introduction_to_history(content.strip())
         else:
@@ -1787,8 +1997,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
     def _flush_open_world(self):
         if not self.current_world_path:
             return
+        _detach_symlink(self.current_world_path / "history.json")
         save_history(self.current_world_path, self.history)
         save_summary_cursor(self.current_world_path, self.covered_count)
+        _detach_symlink(self.current_world_path / "memory_bank.json")
         save_memory_bank(self.current_world_path, self.memory_bank)
 
     def export_world_bytes(self, name):
@@ -1946,17 +2158,13 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 for fname in WORLD_FILES:
                     if fname in ("summary.txt", INTRODUCTION_FILE):
                         continue
-                    path = self.current_world_path / fname
-                    if path.exists():
-                        content = path.read_text(encoding="utf-8").strip()
-                        if content:
-                            world_context += f"=== {fname} ===\n{content}\n"
-                summary_path = self.current_world_path / "summary.txt"
-                summary_content = summary_path.read_text(encoding="utf-8").strip() if summary_path.exists() else ""
+                    content = world_file_text(self.current_world_path, fname).strip()
+                    if content:
+                        world_context += f"=== {fname} ===\n{content}\n"
+                summary_content = world_file_text(self.current_world_path, "summary.txt").strip()
                 if summary_content:
                     world_context += self.tr("prompt.summary_header", text=summary_content)
-                author_path = self.current_world_path / "author_notes.txt"
-                author_notes = author_path.read_text(encoding="utf-8").strip() if author_path.exists() else ""
+                author_notes = world_file_text(self.current_world_path, "author_notes.txt").strip()
                 preview = []
                 preview_tokens = 0
                 for msg in reversed(history):
@@ -1997,4 +2205,4 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         return True
 
     def prompt_view(self):
-        return self.last_sent_prompt
+        return self._redact_value(self.last_sent_prompt)
