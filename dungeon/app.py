@@ -23,6 +23,8 @@ from .i18n import (
 from .tokens import format_token_count
 
 from .storage import (
+    clamp_reasoning_max_tokens,
+    flag_value,
     get_world_list,
     load_global_settings,
     read_world_language,
@@ -54,6 +56,8 @@ class DungeonApp(DialogMixin, AIEngineMixin, ChatMixin, SessionMixin):
         self.model = settings.get("model", "")
         self.active_api_preset = settings.get("active_api_preset", "")
         self.api_presets = settings.get("api_presets", [])
+        self.reasoning = flag_value(settings.get("reasoning", False))
+        self.reasoning_max_tokens = clamp_reasoning_max_tokens(settings.get("reasoning_max_tokens", 1024))
         self.temperature = settings["temperature"]
         self.max_tokens = settings["max_tokens"]
         self.context_size = settings["context_size"]
@@ -179,6 +183,8 @@ class DungeonApp(DialogMixin, AIEngineMixin, ChatMixin, SessionMixin):
                 "response_limits": self.response_limits,
                 "language": self.language,
                 "prompt_overrides": self.prompt_overrides,
+                "reasoning": bool(self.reasoning),
+                "reasoning_max_tokens": self.reasoning_max_tokens,
             }
         )
 

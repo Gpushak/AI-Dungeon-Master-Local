@@ -31,11 +31,39 @@ def extract_message_text(message):
 
 
 class StreamThinkFilter:
-    """Drops <think>...</think> (and similar) even when tags split across chunks."""
+    """Отделяет <think>...</think> от рассказа, даже если теги разрезаны по чанкам.
+
+    feed возвращает только видимый текст. Мысль забирается через take_reasoning.
+    """
 
     def __init__(self):
         self.pending = ""
         self.in_think = False
+        self._fresh = []
+
+    def take_reasoning(self) -> str:
+        if not self._fresh:
+            return ""
+        text = "".join(self._fresh)
+        self._fresh.clear()
+        return text
+
+    def finish(self):
+        """Добирает хвост мысли, если поток оборвался внутри тега."""
+        if self.in_think and self.pending and not (self.pending.startswith("<") and len(self.pending) < 24):
+            self._fresh.append(self.pending)
+        if self.in_think:
+            self.pending = ""
+
+    def _hold_reasoning(self, leftover: str):
+        lt = leftover.rfind("<")
+        if lt != -1 and len(leftover) - lt < 24:
+            if lt:
+                self._fresh.append(leftover[:lt])
+            self.pending = leftover[lt:]
+            return
+        if leftover:
+            self._fresh.append(leftover)
 
     def feed(self, chunk: str) -> str:
         if not chunk:
@@ -48,10 +76,10 @@ class StreamThinkFilter:
             if self.in_think:
                 close = THINK_CLOSE_RE.search(text, i)
                 if not close:
-                    leftover = text[i:]
-                    if leftover.startswith("<") and len(leftover) < 24:
-                        self.pending = leftover
+                    self._hold_reasoning(text[i:])
                     return "".join(out)
+                if close.start() > i:
+                    self._fresh.append(text[i : close.start()])
                 i = close.end()
                 self.in_think = False
                 continue

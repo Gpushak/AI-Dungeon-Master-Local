@@ -78,15 +78,21 @@ from dungeon.tokens import (
 )
 from dungeon.storage import (
     ADVENTURE_DIR,
+    REASONING_FILE,
     CorruptedDataError,
     atomic_write_text,
+    clamp_reasoning_max_tokens,
     clamp_summary_cursor,
     clamp_summary_fill_percent,
     ensure_introduction_in_history,
+    flag_value,
     format_introduction_history,
     load_global_settings,
+    load_reasoning_notes,
     load_world_config,
     normalize_api_presets,
+    save_reasoning_notes,
+    shift_reasoning_notes,
     save_global_settings,
     save_history,
     save_summary_cursor,
@@ -355,6 +361,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self._roll_narration = ""
         mode = settings.get("bind_mode")
         self.bind_mode = mode if mode in ("local", "lan", "tailscale") else ("lan" if self.lan_access else "local")
+        self.reasoning = flag_value(settings.get("reasoning", False))
+        self.reasoning_max_tokens = clamp_reasoning_max_tokens(settings.get("reasoning_max_tokens", 1024))
+        self.reasoning_notes = {}
+        self.draft_reasoning = ""
         self.image_prompt_style = settings.get("image_prompt_style", DEFAULT_IMAGE_STYLE)
         self.image_look = settings.get("image_look", DEFAULT_IMAGE_LOOK)
         if self.image_look not in IMAGE_LOOKS:
@@ -436,6 +446,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.pending_stats = None
         self.last_sent_prompt = None
         self.draft_text = ""
+        self.draft_reasoning = ""
+        self.reasoning_notes = {}
         self._dm_streaming = False
         self.notices = []
         self.update_context_indicator()
@@ -727,6 +739,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
 
     def start_dm_stream(self):
         self.draft_text = ""
+        self.draft_reasoning = ""
         self._dm_streaming = True
         self.emit("dm_start")
 
@@ -734,13 +747,19 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.draft_text += chunk
         self.emit("dm_delta", text=chunk, full=self.draft_text)
 
+    def append_reasoning_stream(self, chunk):
+        self.draft_reasoning += chunk
+        self.emit("dm_reasoning", text=chunk, full=self.draft_reasoning)
+
     def abort_dm_stream(self):
         self.draft_text = ""
+        self.draft_reasoning = ""
         self._dm_streaming = False
         self.emit("dm_abort")
 
     def finalize_dm_stream(self, final_text):
         self.draft_text = ""
+        self.draft_reasoning = ""
         self._dm_streaming = False
         self.emit("dm_done", text=final_text)
         self.emit("history")
@@ -1154,7 +1173,15 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 kind, text = "intro", intro_text(msg)
             else:
                 kind, text = "other", msg
-            rows.append({"index": index, "kind": kind, "text": text})
+            row = {"index": index, "kind": kind, "text": text}
+            note = self.reasoning_notes.get(index) if kind == "dm" else None
+            if isinstance(note, dict):
+                thought = str(note.get("text") or "").strip()
+                if thought:
+                    row["reasoning"] = thought
+                elif note.get("hidden"):
+                    row["reasoning_hidden"] = True
+            rows.append(row)
         return rows
 
     def history_page(self, before):
@@ -1188,6 +1215,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "rev": self.revision,
             "streaming": bool(self._dm_streaming),
             "draft": self.draft_text if self._dm_streaming else "",
+            "draft_reasoning": self.draft_reasoning if self._dm_streaming else "",
             "fill": self.fill_view(),
             "status": self.status_view(),
             "memory": self.memory_view(),
@@ -1282,6 +1310,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         if self.history != loaded_history:
             _detach_symlink(history_path)
             save_history(world_path, self.history)
+        self._load_reasoning_notes(loaded_history)
         self._load_summary_cursor(loaded_history)
         memory_path = world_path / "memory_bank.json"
         if _linked_file(memory_path):
@@ -1311,6 +1340,50 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.update_memory_label()
         self.update_context_indicator()
         self.emit("history")
+
+    def _load_reasoning_notes(self, raw_history):
+        path = self.current_world_path / REASONING_FILE
+        if _linked_file(path):
+            self.reasoning_notes = {}
+            return
+        try:
+            notes = load_reasoning_notes(self.current_world_path)
+        except CorruptedDataError:
+            notes = {}
+        delta = self._introduction_cursor_delta(raw_history, self.history)
+        if delta:
+            notes = shift_reasoning_notes(notes, delta)
+        total = len(self.history)
+        self.reasoning_notes = {index: note for index, note in notes.items() if index < total}
+        if delta:
+            self._save_reasoning_notes()
+
+    def _save_reasoning_notes(self):
+        if not self.current_world_path:
+            return
+        path = self.current_world_path / REASONING_FILE
+        if path.is_symlink():
+            path.unlink()
+        backup = path.with_name(path.name + ".bak")
+        if backup.is_symlink():
+            backup.unlink()
+        save_reasoning_notes(self.current_world_path, self.reasoning_notes)
+
+    def _drop_reasoning_from(self, index):
+        kept = {item: note for item, note in self.reasoning_notes.items() if item < index}
+        if kept == self.reasoning_notes:
+            return
+        self.reasoning_notes = kept
+        self._save_reasoning_notes()
+
+    def record_turn_reasoning(self, index, note):
+        text = str((note or {}).get("text") or "").strip()
+        hidden = flag_value((note or {}).get("hidden", False)) and not text
+        if text or hidden:
+            self.reasoning_notes[index] = {"text": text, "hidden": hidden}
+        else:
+            self.reasoning_notes.pop(index, None)
+        self._save_reasoning_notes()
 
     def _remember_token_scale(self, model=None, lang=None):
         """Запоминает уже измеренный масштаб за моделью и языком текста."""
@@ -1403,6 +1476,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 "token_scale_model": self.model,
                 "token_scale_counter": counter_kind(),
                 "token_scales": self.token_scales,
+                "reasoning": bool(self.reasoning),
+                "reasoning_max_tokens": self.reasoning_max_tokens,
             }
         )
 
@@ -1434,6 +1509,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                     "name": item["name"],
                     "api_url": item.get("api_url") or "",
                     "model": item.get("model") or "",
+                    "reasoning": flag_value(item.get("reasoning", False)),
+                    "reasoning_max_tokens": clamp_reasoning_max_tokens(item.get("reasoning_max_tokens", 1024)),
                     **public_key_fields(item.get("api_key")),
                 }
                 for item in self.api_presets
@@ -1463,6 +1540,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "sandbox_d20": bool(self.sandbox_d20),
             "sandbox_hero": bool(self.sandbox_hero),
             "sandbox_npc": bool(self.sandbox_npc),
+            "reasoning": bool(self.reasoning),
+            "reasoning_max_tokens": self.reasoning_max_tokens,
             "prompts": groups,
             "prompt_overrides": self.prompt_overrides,
         }
@@ -1513,6 +1592,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             self.sandbox_hero = bool(payload.get("sandbox_hero"))
         if "sandbox_npc" in payload:
             self.sandbox_npc = bool(payload.get("sandbox_npc"))
+        if "reasoning" in payload:
+            self.reasoning = flag_value(payload.get("reasoning"), self.reasoning)
+        if "reasoning_max_tokens" in payload:
+            self.reasoning_max_tokens = clamp_reasoning_max_tokens(payload.get("reasoning_max_tokens"))
         if not self.lan_access:
             self.bind_mode = "local"
         elif self.bind_mode == "local":
@@ -1588,6 +1671,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 {
                     "name": item["name"],
                     "model": item.get("model") or "",
+                    "reasoning": flag_value(item.get("reasoning", False)),
+                    "reasoning_max_tokens": clamp_reasoning_max_tokens(item.get("reasoning_max_tokens", 1024)),
                     **public_key_fields(item.get("api_key")),
                 }
                 for item in self.api_presets
@@ -1610,6 +1695,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.api_url = found.get("api_url") or ""
         self.api_key = found.get("api_key") or ""
         self.model = found.get("model") or ""
+        self.reasoning = flag_value(found.get("reasoning", False))
+        self.reasoning_max_tokens = clamp_reasoning_max_tokens(found.get("reasoning_max_tokens", 1024))
         self.active_api_preset = found["name"]
         self._switch_model_scale(previous_model)
         self.save_settings()
@@ -1704,6 +1791,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "dialog.api_key",
             "dialog.show_key",
             "dialog.model",
+            "dialog.reasoning",
+            "dialog.reasoning_max_tokens",
+            "log.reasoning",
+            "log.reasoning_hidden",
             "dialog.manual_preset",
             "dialog.preset_name",
             "dialog.delete_preset_pick",
@@ -1815,6 +1906,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
     def begin_action_turn(self):
         self.notices = []
         self.draft_text = ""
+        self.draft_reasoning = ""
         self.emit("system", text="")
         self.processing = True
         self._begin_operation(ACTION)
@@ -1868,6 +1960,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             return False
         self.history.pop()
         self.covered_count = clamp_summary_cursor(self.covered_count, len(self.history))
+        self._drop_reasoning_from(len(self.history))
         save_history(self.current_world_path, self.history)
         save_summary_cursor(self.current_world_path, self.covered_count)
         self.memory_bank, self.turns_since_memory = sync_memory_bank_after_undo(self.history, self.memory_bank)
@@ -1881,6 +1974,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
     def rewind_last_reply(self):
         if self.history and is_dm_msg(self.history[-1]):
             self.history.pop()
+            self._drop_reasoning_from(len(self.history))
         self.covered_count = clamp_summary_cursor(self.covered_count, len(self.history))
         if self.current_world_path:
             save_summary_cursor(self.current_world_path, self.covered_count)
@@ -1940,6 +2034,9 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         elif intro_msg:
             self.history.insert(0, intro_msg)
         delta = self._introduction_cursor_delta(before, self.history)
+        if delta and self.reasoning_notes:
+            self.reasoning_notes = shift_reasoning_notes(self.reasoning_notes, delta)
+            self._save_reasoning_notes()
         if self.covered_count > 0 and delta:
             self.covered_count += delta
         self.covered_count = clamp_summary_cursor(self.covered_count, len(self.history))
@@ -2002,6 +2099,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         save_summary_cursor(self.current_world_path, self.covered_count)
         _detach_symlink(self.current_world_path / "memory_bank.json")
         save_memory_bank(self.current_world_path, self.memory_bank)
+        self._save_reasoning_notes()
 
     def export_world_bytes(self, name):
         with self._job_lock:
@@ -2109,6 +2207,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.pending_stats = None
         self.last_sent_prompt = None
         self.draft_text = ""
+        self.draft_reasoning = ""
+        self.reasoning_notes = {}
         self._dm_streaming = False
         self.notices = []
         loaded = False

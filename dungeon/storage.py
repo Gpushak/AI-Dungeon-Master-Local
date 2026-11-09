@@ -217,6 +217,26 @@ def save_history(world_path, history):
     atomic_write_json(Path(world_path) / "history.json", history)
 
 
+def flag_value(value, default=False):
+    """Булево из JSON: строка «false» не должна становиться истиной."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "да"}
+    return default
+
+
+def clamp_reasoning_max_tokens(value, default=1024):
+    """Потолок рассуждения: 64–32768. Пустое и битое значение — 1024."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return min(32768, max(64, number))
+
+
 def normalize_api_presets(presets):
     if not isinstance(presets, list):
         return []
@@ -233,6 +253,8 @@ def normalize_api_presets(presets):
                 "api_url": str(preset.get("api_url", "")),
                 "api_key": str(preset.get("api_key", "")),
                 "model": str(preset.get("model", "")),
+                "reasoning": flag_value(preset.get("reasoning", False)),
+                "reasoning_max_tokens": clamp_reasoning_max_tokens(preset.get("reasoning_max_tokens", 1024)),
             }
         )
     return normalized
@@ -262,6 +284,8 @@ def load_global_settings():
         "prompt_overrides": {"ru": {}, "en": {}},
         "lan_access": True,
         "bind_mode": "lan",
+        "reasoning": False,
+        "reasoning_max_tokens": 1024,
     }
     # Настройки тоже читаем с попыткой отката на .bak: потерять сохранённые
     # API-ключи из-за битого JSON неприятно, а дефолты работают и без них.
@@ -284,6 +308,8 @@ def load_global_settings():
     defaults["response_limits"] = clamp_response_limits(defaults.get("response_limits"))
     defaults["summary_fill_percent"] = clamp_summary_fill_percent(defaults.get("summary_fill_percent", 80))
     defaults["prompt_overrides"] = normalize_prompt_overrides(defaults.get("prompt_overrides"))
+    defaults["reasoning"] = flag_value(defaults.get("reasoning", False))
+    defaults["reasoning_max_tokens"] = clamp_reasoning_max_tokens(defaults.get("reasoning_max_tokens", 1024))
     return defaults
 
 
@@ -348,6 +374,62 @@ def default_summary_cursor(world_path, history_len):
     if summary.strip():
         return clamp_summary_cursor(history_len, history_len)
     return 0
+
+
+REASONING_FILE = "reasoning.json"
+
+
+def normalize_reasoning_notes(raw):
+    """Индекс сообщения -> текст мысли. В промпт этот словарь не попадает."""
+    if not isinstance(raw, dict):
+        return {}
+    notes = {}
+    for key, value in raw.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if index < 0:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                notes[index] = {"text": text, "hidden": False}
+            continue
+        if not isinstance(value, dict):
+            continue
+        text = str(value.get("text") or "").strip()
+        hidden = flag_value(value.get("hidden", False)) and not text
+        if text or hidden:
+            notes[index] = {"text": text, "hidden": hidden}
+    return notes
+
+
+def load_reasoning_notes(world_path):
+    path = Path(world_path) / REASONING_FILE
+    if not path.exists() and not backup_path(path).exists():
+        return {}
+    data, _restored = read_json_with_backup(path, {})
+    return normalize_reasoning_notes(data)
+
+
+def save_reasoning_notes(world_path, notes):
+    payload = {}
+    for index, note in sorted(normalize_reasoning_notes({str(key): value for key, value in (notes or {}).items()}).items()):
+        payload[str(index)] = note
+    atomic_write_json(Path(world_path) / REASONING_FILE, payload)
+
+
+def shift_reasoning_notes(notes, delta, at=0):
+    """Сдвигает индексы, если в начало истории вставили или убрали вступление."""
+    if not delta:
+        return dict(notes or {})
+    shifted = {}
+    for index, note in (notes or {}).items():
+        moved = index + delta if index >= at else index
+        if moved >= 0:
+            shifted[moved] = note
+    return shifted
 
 
 def save_summary_cursor(world_path, covered_count):

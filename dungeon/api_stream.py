@@ -5,7 +5,8 @@ from threading import Event
 
 import requests
 
-from .text_utils import extract_message_text, strip_reasoning_blocks
+from .storage import clamp_reasoning_max_tokens
+from .text_utils import strip_reasoning_blocks
 
 # Операции, которые можно прервать кнопкой остановки
 ACTION = "action"
@@ -68,25 +69,108 @@ def _remember_usage(data, usage_box):
 
 def _delta_content(data):
     """Текст одной дельты потока (choices[0].delta.content)."""
+    for kind, text in _choice_parts(data):
+        if kind == "content" and text:
+            return text
+    return ""
+
+
+def _reasoning_text(value):
+    """Текст рассуждения: строка, кусок сообщения или список частей."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content", "reasoning"):
+            found = value.get(key)
+            if isinstance(found, str) and found:
+                return found
+        return ""
+    if isinstance(value, list):
+        return _raw_content(value)
+    return ""
+
+
+def _message_parts(source):
+    """Пара (канал, текст). Канал reasoning не смешивается с рассказом."""
+    if not isinstance(source, dict):
+        text = _raw_content(source)
+        return [("content", text)] if text else []
+    parts = []
+    reasoning = _reasoning_text(source.get("reasoning_content"))
+    if not reasoning:
+        reasoning = _reasoning_text(source.get("reasoning"))
+    if reasoning:
+        parts.append(("reasoning", reasoning))
+    content = _raw_content(source.get("content"))
+    if content:
+        parts.append(("content", content))
+    return parts
+
+
+def _choice_parts(data):
     choice = _first_choice(data)
     delta = choice.get("delta")
     if isinstance(delta, dict):
-        return _raw_content(delta.get("content"))
-    # Некоторые серверы присылают в дельте сразу объект message
+        parts = _message_parts(delta)
+        if parts:
+            return parts
     message = choice.get("message")
     if isinstance(message, dict):
-        return _raw_content(message.get("content"))
-    return _raw_content(message)
+        return _message_parts(message)
+    return []
+
+
+def reasoning_effort_name(limit):
+    """У OpenAI нет числового потолка: до 512 low, до 2048 medium, дальше high."""
+    if limit <= 512:
+        return "low"
+    if limit <= 2048:
+        return "medium"
+    return "high"
+
+
+def reasoning_token_count(usage):
+    """Сколько токенов мысли насчитала модель, даже если текст не прислала."""
+    if not isinstance(usage, dict):
+        return 0
+    sources = (usage, usage.get("completion_tokens_details"), usage.get("output_tokens_details"))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        value = source.get("reasoning_tokens")
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    return 0
+
+
+_REASONING_STRIP_KEYS = {
+    "include_reasoning",
+    "reasoning",
+    "reasoning_effort",
+    "enable_thinking",
+    "chat_template_kwargs",
+    "thinking",
+    "no_thinking",
+    "max_completion_tokens",
+    "stream_options",
+}
 
 
 def _iter_response_deltas(response, usage_box=None):
-    """Отдаёт текстовые дельты из ответа OpenAI-совместимого API.
+    """Отдаёт только текст ответа. Рассуждение остаётся в отдельном канале."""
+    for kind, text in _iter_response_parts(response, usage_box):
+        if kind == "content" and text:
+            yield text
 
-    Понимает и поток SSE, и обычный JSON: если сервер проигнорировал
-    stream, тело разбирается как единый объект и отдаётся одной дельтой.
-    Благодаря общему чтению любая генерация (ответ Мастера, суммаризация,
-    память, описание карточки) принимает одинаковый прерываемый цикл.
-    usage_box, если передан, заполняется последним объектом usage.
+
+def _iter_response_parts(response, usage_box=None):
+    """Отдаёт пары (канал, текст) из потока SSE или обычного JSON.
+
+    Канал content — рассказ. Канал reasoning — отдельное поле
+    reasoning_content или reasoning. Теги внутри content здесь не режутся:
+    это делает фильтр хода, чтобы мысль не пропала раньше, чем её отделят.
     """
     decoder = codecs.getincrementaldecoder("utf-8")("ignore")
     buffer = ""
@@ -97,9 +181,9 @@ def _iter_response_deltas(response, usage_box=None):
         try:
             data = json.loads(line[5:].strip())
         except ValueError:
-            return ""
+            return []
         _remember_usage(data, usage_box)
-        return _delta_content(data)
+        return _choice_parts(data)
 
     # chunk_size=None заставляет urllib3 копить данные в буфер до упора: текст
     # приходил одним куском в самом конце и «потоковый» режим не работал.
@@ -120,9 +204,9 @@ def _iter_response_deltas(response, usage_box=None):
             saw_sse = True
             if line[5:].strip() == "[DONE]":
                 return
-            content = parse_data_line(line)
-            if content:
-                yield content
+            for kind, text in parse_data_line(line):
+                if text:
+                    yield kind, text
 
     # Последняя строка часто приходит без перевода строки
     tail = buffer.strip()
@@ -131,9 +215,9 @@ def _iter_response_deltas(response, usage_box=None):
     if tail.startswith("data:"):
         if tail[5:].strip() == "[DONE]":
             return
-        content = parse_data_line(tail)
-        if content:
-            yield content
+        for kind, text in parse_data_line(tail):
+            if text:
+                yield kind, text
     elif not saw_sse:
         body_lines.append(tail)
 
@@ -143,9 +227,10 @@ def _iter_response_deltas(response, usage_box=None):
         except ValueError:
             return
         _remember_usage(data, usage_box)
-        content = extract_message_text(_first_choice(data).get("message"))
-        if content:
-            yield content
+        message = _first_choice(data).get("message")
+        for kind, text in _message_parts(message if isinstance(message, dict) else {}):
+            if text:
+                yield kind, text
 
 
 class DeltaBatcher:
@@ -186,19 +271,46 @@ class ApiMixin:
         return headers
 
     def _api_payload(self, **fields):
+        allow_reasoning = bool(fields.pop("allow_reasoning", False))
         payload = dict(fields)
         if self.model:
             payload["model"] = self.model
-        # Disable chain-of-thought across common OpenAI-compatible providers.
-        payload["include_reasoning"] = False
-        payload["reasoning"] = {"effort": "none", "exclude": True, "enabled": False}
-        payload["reasoning_effort"] = "none"
-        payload["enable_thinking"] = False
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
-        # DeepSeek-specific parameters
-        payload["thinking"] = {"enabled": False}
-        payload["no_thinking"] = True
-        if fields.get("stream"):
+        if allow_reasoning:
+            # Один набор полей на разные серверы: незнакомые ключи они пропускают.
+            # Общий max_tokens растёт на бюджет мысли, потому что локальные
+            # серверы часто считают мысль и ответ одним лимитом.
+            limit = clamp_reasoning_max_tokens(getattr(self, "reasoning_max_tokens", 1024))
+            effort = reasoning_effort_name(limit)
+            try:
+                reply_limit = int(payload.get("max_tokens") or 0)
+            except (TypeError, ValueError):
+                reply_limit = 0
+            if reply_limit > 0:
+                total = reply_limit + limit
+                payload["max_tokens"] = total
+                payload["max_completion_tokens"] = total
+            payload["include_reasoning"] = True
+            payload["reasoning"] = {
+                "effort": effort,
+                "max_tokens": limit,
+                "exclude": False,
+                "enabled": True,
+            }
+            payload["reasoning_effort"] = effort
+            payload["enable_thinking"] = True
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
+            payload["thinking"] = {"type": "enabled"}
+        else:
+            # Disable chain-of-thought across common OpenAI-compatible providers.
+            payload["include_reasoning"] = False
+            payload["reasoning"] = {"effort": "none", "exclude": True, "enabled": False}
+            payload["reasoning_effort"] = "none"
+            payload["enable_thinking"] = False
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            # DeepSeek-specific parameters
+            payload["thinking"] = {"enabled": False}
+            payload["no_thinking"] = True
+        if payload.get("stream"):
             # Без этого поток не содержит usage, и «Ответ» приходится оценивать локально.
             payload["stream_options"] = {"include_usage": True}
         return payload
@@ -206,21 +318,7 @@ class ApiMixin:
     def _api_post(self, payload, **request_kwargs):
         response = requests.post(self.api_url, json=payload, headers=self._api_headers(), **request_kwargs)
         if response.status_code == 400:
-            stripped = {
-                key: value
-                for key, value in payload.items()
-                if key
-                not in {
-                    "include_reasoning",
-                    "reasoning",
-                    "reasoning_effort",
-                    "enable_thinking",
-                    "chat_template_kwargs",
-                    "thinking",
-                    "no_thinking",
-                    "stream_options",
-                }
-            }
+            stripped = {key: value for key, value in payload.items() if key not in _REASONING_STRIP_KEYS}
             if stripped != payload:
                 response.close()
                 retry = requests.post(self.api_url, json=stripped, headers=self._api_headers(), **request_kwargs)
@@ -258,11 +356,12 @@ class ApiMixin:
                 stopped.append(op)
         return stopped
 
-    def _read_response(self, response, cancel_key, on_delta=None):
+    def _read_response(self, response, cancel_key, on_delta=None, on_reasoning=None):
         """Читает ответ API целиком, прерываясь по запросу остановки.
 
-        on_delta вызывается для каждой дельты и возвращает текст, который
-        нужно оставить в ответе (None — ничего не добавлять).
+        on_delta вызывается для каждой дельты рассказа и возвращает текст,
+        который нужно оставить в ответе (None — ничего не добавлять).
+        on_reasoning, если передан, получает отдельный канал мысли.
         Возвращает пару (текст, признак прерывания).
         """
         parts = []
@@ -270,10 +369,14 @@ class ApiMixin:
         usage = {}
         self._last_api_usage = None
         try:
-            for delta in _iter_response_deltas(response, usage):
+            for kind, delta in _iter_response_parts(response, usage):
                 if self.is_cancelled(cancel_key):
                     cancelled = True
                     break
+                if kind == "reasoning":
+                    if on_reasoning is not None:
+                        on_reasoning(delta)
+                    continue
                 if on_delta is None:
                     parts.append(delta)
                 else:

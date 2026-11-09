@@ -220,6 +220,20 @@ function nearBottom() {
   return document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 180;
 }
 
+function reasoningBlock(text, hidden, live) {
+  if (!text && !hidden && !live) return null;
+  const details = document.createElement("details");
+  details.className = "reasoning";
+  if (live) details.open = true;
+  const summary = document.createElement("summary");
+  summary.textContent = t("log.reasoning");
+  const body = document.createElement("div");
+  body.className = "reasoning-body";
+  body.textContent = text || (hidden ? t("log.reasoning_hidden") : "");
+  details.append(summary, body);
+  return details;
+}
+
 function renderLog(mode = "end", draftOverride) {
   if (!state) return;
   const fromDom = document.querySelector("#draft")?.textContent || "";
@@ -227,6 +241,7 @@ function renderLog(mode = "end", draftOverride) {
   const draftText = drafting
     ? (typeof draftOverride === "string" ? draftOverride : (fromState.length >= fromDom.length ? fromState : fromDom))
     : "";
+  const draftReasoning = drafting && state && typeof state.draft_reasoning === "string" ? state.draft_reasoning : "";
   const stick = mode === "end" || (mode === "follow" && nearBottom());
   const anchorY = window.scrollY;
   const anchorHeight = document.documentElement.scrollHeight;
@@ -243,6 +258,10 @@ function renderLog(mode = "end", draftOverride) {
   for (const row of state.history) {
     if (!lineBeforeDraft && freshIndex != null && row.index === freshIndex) {
       logEl.appendChild(freshMark());
+    }
+    if (row.kind === "dm" && (row.reasoning || row.reasoning_hidden)) {
+      const thought = reasoningBlock(row.reasoning || "", Boolean(row.reasoning_hidden), false);
+      if (thought) logEl.appendChild(thought);
     }
     const p = document.createElement("p");
     p.className = row.kind;
@@ -264,6 +283,11 @@ function renderLog(mode = "end", draftOverride) {
   }
   if (drafting) {
     if (lineBeforeDraft) logEl.appendChild(freshMark());
+    const thought = reasoningBlock(draftReasoning, false, true);
+    if (thought) {
+      thought.id = "draft-reasoning";
+      logEl.appendChild(thought);
+    }
     const p = document.createElement("p");
     p.className = "dm draft";
     p.id = "draft";
@@ -288,6 +312,18 @@ function ensureDraft() {
   draft.id = "draft";
   logEl.appendChild(draft);
   return draft;
+}
+
+function ensureDraftReasoning() {
+  const draft = ensureDraft();
+  if (!draft) return null;
+  let block = document.querySelector("#draft-reasoning");
+  if (block) return block;
+  block = reasoningBlock("", false, true);
+  if (!block) return null;
+  block.id = "draft-reasoning";
+  draft.before(block);
+  return block;
 }
 
 async function loadOlder() {
@@ -366,14 +402,18 @@ async function selectPreset(name) {
     settingsCache.api_key_set = Boolean(found.api_key_set);
     settingsCache.api_key_last4 = found.api_key_last4 || "";
     settingsCache.model = found.model || "";
+    settingsCache.reasoning = Boolean(found.reasoning);
+    settingsCache.reasoning_max_tokens = Number(found.reasoning_max_tokens) || 1024;
     const preset = document.querySelector("#settings-preset");
     if (preset) preset.value = found.name;
-    for (const key of ["api_url", "model"]) {
+    for (const key of ["api_url", "model", "reasoning_max_tokens"]) {
       const input = document.querySelector(`[data-setting="${key}"]`);
       if (input) input.value = settingsCache[key];
     }
     const keyInput = document.querySelector('[data-setting="api_key"]');
     if (keyInput) keyInput.value = "";
+    const reasoningInput = document.querySelector('[data-setting="reasoning"]');
+    if (reasoningInput) reasoningInput.checked = Boolean(settingsCache.reasoning);
     paintStoredKeyNote();
   } catch (error) {
     failNotice(error);
@@ -593,6 +633,7 @@ function regresses(snap) {
   if (snap.rev !== state.rev) return snap.rev < state.rev;
   if ((snap.history_total || 0) < (state.history_total || 0)) return true;
   if (state.streaming && snap.streaming && (snap.draft || "").length < (state.draft || "").length) return true;
+  if (state.streaming && snap.streaming && (snap.draft_reasoning || "").length < (state.draft_reasoning || "").length) return true;
   if (state.streaming && !snap.streaming && (state.draft || "") && (snap.history_total || 0) === (state.history_total || 0)) return true;
   return false;
 }
@@ -618,6 +659,7 @@ function applySnapshot(snap, mode = "end") {
     && state
     && snap.rev === revision
     && serverDraft === (state.draft || "")
+    && (snap.draft_reasoning || "") === (state.draft_reasoning || "")
     && Boolean(snap.streaming) === Boolean(state.streaming)
     && snap.history_total === state.history_total
     && snap.status?.text === state.status?.text
@@ -766,6 +808,21 @@ function connectEvents() {
         }
       }
       if (follow) jumpToEnd();
+    } else if (event.kind === "dm_reasoning") {
+      if (draftClosed) return;
+      const follow = nearBottom();
+      const block = ensureDraftReasoning();
+      if (!block) return;
+      const body = block.querySelector(".reasoning-body");
+      const next = typeof event.full === "string" ? event.full : `${body ? body.textContent : ""}${event.text || ""}`;
+      if (body && next.length >= body.textContent.length) {
+        setNodeText(body, next);
+        if (state) {
+          state.streaming = true;
+          state.draft_reasoning = next;
+        }
+      }
+      if (follow) jumpToEnd();
     } else if (event.kind === "fill") {
       paintFill(event);
     } else if (event.kind === "meters") {
@@ -788,6 +845,7 @@ function connectEvents() {
       if (state) {
         state.streaming = false;
         state.draft = "";
+        state.draft_reasoning = "";
       }
       refresh("end").catch(() => {});
     } else if (event.kind === "history") {
@@ -2117,6 +2175,7 @@ function paintSettingsForm(preferredTab) {
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = Boolean(settingsCache[key]);
+    input.dataset.setting = key;
     input.addEventListener("change", () => { settingsCache[key] = input.checked; });
     wrap.append(input, document.createTextNode(" " + label));
     return wrap;
@@ -2178,6 +2237,13 @@ function paintSettingsForm(preferredTab) {
     key.append(keyCaption, keyInput);
     setNodeText(keyNote, keyStatusText() ? ` ${keyStatusText()}` : "");
     const model = field(t("dialog.model"), "model");
+    const reasoningBox = check(t("dialog.reasoning"), "reasoning");
+    const reasoningLimit = field(t("dialog.reasoning_max_tokens"), "reasoning_max_tokens", {
+      type: "number",
+      min: 64,
+      max: 32768,
+      step: 64,
+    });
     preset.addEventListener("change", () => {
       settingsCache.active_api_preset = preset.value;
       settingsCache.api_key = "";
@@ -2193,8 +2259,12 @@ function paintSettingsForm(preferredTab) {
       settingsCache.api_key_set = Boolean(found.api_key_set);
       settingsCache.api_key_last4 = found.api_key_last4 || "";
       settingsCache.model = found.model || "";
+      settingsCache.reasoning = Boolean(found.reasoning);
+      settingsCache.reasoning_max_tokens = Number(found.reasoning_max_tokens) || 1024;
       url.querySelector("input").value = settingsCache.api_url;
       model.querySelector("input").value = settingsCache.model;
+      reasoningBox.querySelector("input").checked = settingsCache.reasoning;
+      reasoningLimit.querySelector("input").value = String(settingsCache.reasoning_max_tokens);
       paintStoredKeyNote();
     });
     const showKey = check(t("dialog.show_key"), "show_api_key");
@@ -2215,6 +2285,8 @@ function paintSettingsForm(preferredTab) {
         api_url: settingsCache.api_url || "",
         api_key: settingsCache.api_key || "",
         model: settingsCache.model || "",
+        reasoning: Boolean(settingsCache.reasoning),
+        reasoning_max_tokens: Number(settingsCache.reasoning_max_tokens) || 1024,
       };
       const list = settingsCache.api_presets || [];
       const index = list.findIndex((item) => item.name === data.name);
@@ -2250,6 +2322,8 @@ function paintSettingsForm(preferredTab) {
       key,
       showKey,
       model,
+      reasoningBox,
+      reasoningLimit,
       field(t("dialog.temperature"), "temperature", { type: "number", min: 0, max: 2, step: 0.1 }),
       field(t("dialog.context_size"), "context_size", { type: "number", min: 4096, max: 131072, step: 4096 }),
     );

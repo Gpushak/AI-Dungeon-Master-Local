@@ -115,6 +115,11 @@ class SettingsMixin:
             }
             existing_idx = next((i for i, p in enumerate(api_presets_local) if p["name"] == name), None)
             if existing_idx is not None:
+                previous = api_presets_local[existing_idx]
+                if "reasoning" in previous:
+                    preset_data["reasoning"] = previous.get("reasoning", False)
+                if "reasoning_max_tokens" in previous:
+                    preset_data["reasoning_max_tokens"] = previous.get("reasoning_max_tokens", 1024)
                 api_presets_local[existing_idx] = preset_data
             else:
                 api_presets_local.append(preset_data)

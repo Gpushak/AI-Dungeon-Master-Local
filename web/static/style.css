@@ -290,6 +290,16 @@ main {
 #log .intro { color: var(--gold); font-style: italic; }
 #log .system, #log .other { color: var(--system); font-size: 14px; font-style: italic; }
 #log .draft { opacity: 0.85; }
+#log .reasoning {
+  margin: 0 0 0.45em;
+  color: var(--muted);
+  font-size: 14px;
+}
+#log .reasoning summary { cursor: pointer; }
+#log .reasoning .reasoning-body {
+  margin: 0.35em 0 0;
+  white-space: pre-wrap;
+}
 #log .fresh-mark {
   height: 0;
   margin: 0.2em 0 1.15em;

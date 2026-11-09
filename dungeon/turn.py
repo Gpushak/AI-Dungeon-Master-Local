@@ -2,7 +2,7 @@ from datetime import datetime
 
 import requests
 
-from .api_stream import ACTION, DeltaBatcher
+from .api_stream import ACTION, DeltaBatcher, reasoning_token_count
 from .i18n import DM_PREFIX, PLAYER_PREFIX, localize_history, normalize_lang, t
 from .storage import read_world_language, save_history
 from .text_utils import StreamThinkFilter, clean_dm_response, clean_stream_chunk
@@ -114,6 +114,12 @@ class TurnMixin:
 
             history_text = "\n".join(localize_history(self.language, short_history))
             system_final_content = f"""{context}\n{t(self.language, 'prompt.history_header')}\n{history_text}"""
+            reasoning_on = bool(getattr(self, "reasoning", False))
+            system_message = system_final_content
+            if not reasoning_on:
+                system_message += "\n\n" + t(self.language, "prompt.no_reasoning")
+            # Масштаб токенов считается по тексту хода, как и раньше, без хвоста
+            # «без размышлений»: его длина не должна сдвигать сверку с моделью.
             raw_prompt = raw_count_tokens(system_final_content) + raw_count_tokens(user_content)
             prompt_tokens = scale_token_count(raw_prompt)
 
@@ -124,17 +130,22 @@ class TurnMixin:
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
+            stops = [
+                f"\n{PLAYER_PREFIX}",
+                PLAYER_PREFIX,
+                f"\n{t(self.language, 'hist.player')}",
+                t(self.language, "hist.player"),
+                "<|im_end|>",
+                "<|eot_id|>",
+                "```",
+                "---",
+            ]
+            if not reasoning_on:
+                stops.extend(["<think>", "</think>"])
+
             payload = self._api_payload(
                 messages=[
-                    {
-                        "role": "system",
-                        "content": system_final_content
-                        + "\n\n"
-                        + t(
-                            self.language,
-                            "prompt.no_reasoning",
-                        ),
-                    },
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": user_content},
                 ],
                 temperature=self.temperature,
@@ -142,18 +153,8 @@ class TurnMixin:
                 # Поток запрашивается всегда: только так ответ можно прервать
                 # кнопкой остановки. stream_mode теперь управляет показом.
                 stream=True,
-                stop=[
-                    f"\n{PLAYER_PREFIX}",
-                    PLAYER_PREFIX,
-                    f"\n{t(self.language, 'hist.player')}",
-                    t(self.language, "hist.player"),
-                    "<|im_end|>",
-                    "<|eot_id|>",
-                    "```",
-                    "---",
-                    "<think>",
-                    "</think>",
-                ],
+                stop=stops,
+                allow_reasoning=reasoning_on,
             )
 
             response = self._api_post(payload, stream=True, timeout=180)
@@ -164,20 +165,41 @@ class TurnMixin:
             self.root.after(0, self.start_dm_stream)
 
             think_filter = StreamThinkFilter()
+            reason_box = []
             # Дельты копятся и уходят в Tk пачками — см. DeltaBatcher
             batcher = DeltaBatcher(
                 lambda chunk: self.root.after(0, lambda c=chunk: self.append_to_dm_stream(c))
             )
+            reason_batcher = DeltaBatcher(
+                lambda chunk: self.root.after(0, lambda c=chunk: self._emit_reasoning(c))
+            )
+
+            def remember_reasoning(piece):
+                if not piece or not reasoning_on:
+                    return
+                reason_box.append(piece)
+                if self.stream_mode:
+                    reason_batcher.add(piece)
+
+            def on_reasoning(delta):
+                remember_reasoning(clean_stream_chunk(delta))
 
             def on_delta(delta):
                 content = clean_stream_chunk(think_filter.feed(delta))
+                remember_reasoning(clean_stream_chunk(think_filter.take_reasoning()))
                 if content and self.stream_mode:
                     batcher.add(content)
                 return content
 
-            ai_text, cancelled = self._read_response(response, ACTION, on_delta)
+            if reasoning_on:
+                ai_text, cancelled = self._read_response(response, ACTION, on_delta, on_reasoning)
+            else:
+                ai_text, cancelled = self._read_response(response, ACTION, on_delta)
+            think_filter.finish()
+            remember_reasoning(clean_stream_chunk(think_filter.take_reasoning()))
             # Хвост, накопившийся за последние 50 мс, показываем сразу
             batcher.flush_now()
+            reason_batcher.flush_now()
 
             if not ai_text:
                 # Пустой ответ: убираем заголовок Мастера, чтобы не оставлять
@@ -193,6 +215,7 @@ class TurnMixin:
             # сразу: иначе страница успевает увидеть пустой черновик без ответа.
             self.history.append(f"{DM_PREFIX} {final_narration}")
             save_history(self.current_world_path, self.history)
+            self._store_turn_reasoning(reason_box, reasoning_on)
             self.root.after(0, lambda f=final_narration: self.finalize_dm_stream(f))
 
             if cancelled:
@@ -244,6 +267,21 @@ class TurnMixin:
             self.root.after(0, lambda msg=err_msg: self.add_system_message(self.tr("msg.error", msg=msg)))
         finally:
             self.root.after(0, self._finish_player_turn)
+
+    def _emit_reasoning(self, chunk):
+        hook = getattr(self, "append_reasoning_stream", None)
+        if hook is not None and chunk:
+            hook(chunk)
+
+    def _store_turn_reasoning(self, reason_box, reasoning_on):
+        record = getattr(self, "record_turn_reasoning", None)
+        if record is None or not reasoning_on or not self.history:
+            return
+        text = "".join(reason_box).strip()
+        hidden = not text and reasoning_token_count(getattr(self, "_last_api_usage", None)) > 0
+        if not text and not hidden:
+            return
+        record(len(self.history) - 1, {"text": text, "hidden": hidden})
 
     def _finish_player_turn(self):
         self.processing = False

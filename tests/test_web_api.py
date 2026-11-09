@@ -24,6 +24,17 @@ class _Response:
         return None
 
 
+def _try_symlink(link: Path, target: Path, directory=False):
+    """Создаёт ссылку. Без права Windows возвращает False, а не роняет набор."""
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            return False
+        raise
+    return True
+
+
 def _use_tmp(tmp: Path):
     tmp.mkdir(parents=True, exist_ok=True)
     settings = tmp / "settings.json"
@@ -1052,19 +1063,21 @@ def test_world_guards_settings_and_startup():
         outside = Path(tempfile.mkdtemp())
         (outside / "history.json").write_text("[]", encoding="utf-8")
         link = tmp / "Linked"
-        link.symlink_to(outside, target_is_directory=True)
+        linked = _try_symlink(link, outside, directory=True)
         release = __import__("threading").Event()
         try:
             assert client.post("/api/worlds/open", json={"name": ".."}).status_code == 400
             assert client.post("/api/worlds/open", json={"name": "../Camp"}).status_code == 400
             assert client.post("/api/worlds/open", json={"name": str(outside)}).status_code == 400
-            assert client.post("/api/worlds/open", json={"name": "Linked"}).status_code == 400
+            if linked:
+                assert client.post("/api/worlds/open", json={"name": "Linked"}).status_code == 400
             assert client.get("/api/state").json()["world"] == "Camp"
             assert client.delete("/api/worlds/%2e%2e").status_code == 400
             assert (tmp / "Camp").is_dir()
-            assert client.delete("/api/worlds/Linked").status_code == 400
-            assert outside.is_dir()
-            assert (outside / "history.json").is_file()
+            if linked:
+                assert client.delete("/api/worlds/Linked").status_code == 400
+                assert outside.is_dir()
+                assert (outside / "history.json").is_file()
 
             kept = client.put("/api/settings", json={"temperature": "hot", "context_size": 0, "max_tokens": None})
             assert kept.status_code == 200, kept.text
@@ -1118,7 +1131,8 @@ def test_world_guards_settings_and_startup():
         assert state["fill"]["ratio"] == 0
         assert state["memory"]["entries"] == []
         assert client.post("/api/summary").status_code == 409
-    print("OK  чужие пути закрыты, битый мир не роняет сервер, ход блокирует правки")
+    note = "" if linked else " Ссылку на чужую папку пропустили: у процесса нет этого права Windows."
+    print("OK  чужие пути закрыты, битый мир не роняет сервер, ход блокирует правки" + note)
 
 
 def _js_function(source, name):
@@ -1233,39 +1247,40 @@ def test_world_paths_and_hidden_key():
             assert client.post("/api/worlds/open", json={"name": str(outside)}).status_code == 400
             assert client.post("/api/worlds/open", json={"name": "/etc"}).status_code == 400
             link = tmp / "Linked"
-            link.symlink_to(outside, target_is_directory=True)
-            assert client.post("/api/worlds/open", json={"name": "Linked"}).status_code == 400
-            assert client.delete("/api/worlds/Linked").status_code == 400
-            assert outside.is_dir()
+            linked = _try_symlink(link, outside, directory=True)
+            if linked:
+                assert client.post("/api/worlds/open", json={"name": "Linked"}).status_code == 400
+                assert client.delete("/api/worlds/Linked").status_code == 400
+                assert outside.is_dir()
 
-            leak = outside / "leak.txt"
-            leak.write_text("OUTSIDE_FILE_SECRET", encoding="utf-8")
-            plot = tmp / "Camp" / "plot_basics.txt"
-            plot.unlink()
-            plot.symlink_to(leak)
-            files = client.get("/api/files")
-            assert files.status_code == 200, files.text
-            assert files.json()["plot_basics.txt"] == ""
-            assert "OUTSIDE_FILE_SECRET" not in files.text
-            exported = client.get("/api/worlds/Camp/export")
-            assert exported.status_code == 200, exported.text
-            with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
-                names = set(archive.namelist())
-                blob = b"\n".join(archive.read(name) for name in names)
-            assert "plot_basics.txt" not in names
-            assert b"OUTSIDE_FILE_SECRET" not in blob
+                leak = outside / "leak.txt"
+                leak.write_text("OUTSIDE_FILE_SECRET", encoding="utf-8")
+                plot = tmp / "Camp" / "plot_basics.txt"
+                plot.unlink()
+                assert _try_symlink(plot, leak)
+                files = client.get("/api/files")
+                assert files.status_code == 200, files.text
+                assert files.json()["plot_basics.txt"] == ""
+                assert "OUTSIDE_FILE_SECRET" not in files.text
+                exported = client.get("/api/worlds/Camp/export")
+                assert exported.status_code == 200, exported.text
+                with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+                    names = set(archive.namelist())
+                    blob = b"\n".join(archive.read(name) for name in names)
+                assert "plot_basics.txt" not in names
+                assert b"OUTSIDE_FILE_SECRET" not in blob
 
-            (outside / "history.json").write_text(
-                json.dumps(["Мастер: OUTSIDE_HISTORY_SECRET"], ensure_ascii=False),
-                encoding="utf-8",
-            )
-            history_path = tmp / "Camp" / "history.json"
-            history_path.unlink()
-            history_path.symlink_to(outside / "history.json")
-            opened = client.post("/api/worlds/open", json={"name": "Camp"})
-            assert opened.status_code == 200, opened.text
-            assert "OUTSIDE_HISTORY_SECRET" not in opened.text
-            assert leak.read_text(encoding="utf-8") == "OUTSIDE_FILE_SECRET"
+                (outside / "history.json").write_text(
+                    json.dumps(["Мастер: OUTSIDE_HISTORY_SECRET"], ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                history_path = tmp / "Camp" / "history.json"
+                history_path.unlink()
+                assert _try_symlink(history_path, outside / "history.json")
+                opened = client.post("/api/worlds/open", json={"name": "Camp"})
+                assert opened.status_code == 200, opened.text
+                assert "OUTSIDE_HISTORY_SECRET" not in opened.text
+                assert leak.read_text(encoding="utf-8") == "OUTSIDE_FILE_SECRET"
 
             slipped = io.BytesIO()
             with zipfile.ZipFile(slipped, "w") as archive:
@@ -1338,7 +1353,8 @@ def test_world_paths_and_hidden_key():
             assert json.loads((tmp / "settings.json").read_text(encoding="utf-8"))["api_key"] == "sk-test-Replacement-0009"
         finally:
             shutil.rmtree(outside, ignore_errors=True)
-    print("OK  чужие пути и сохранённый ключ не выходят через веб-API")
+    note = "" if linked else " Ссылки на чужие файлы пропустили: у процесса нет этого права Windows."
+    print("OK  чужие пути и сохранённый ключ не выходят через веб-API" + note)
 
 
 def test_overlapping_jobs_start_once():
@@ -2258,6 +2274,274 @@ def test_scene_image_api():
     print("OK  картинка сцены сохраняется в мире и не читается снаружи папки")
 
 
+def test_reasoning_stays_out_of_the_story():
+    import tempfile
+
+    import dungeon.api_stream as api_stream
+    from dungeon.api_stream import reasoning_effort_name
+    from dungeon.text_utils import StreamThinkFilter
+
+    assert reasoning_effort_name(512) == "low"
+    assert reasoning_effort_name(513) == "medium"
+    assert reasoning_effort_name(2048) == "medium"
+    assert reasoning_effort_name(2049) == "high"
+    think = StreamThinkFilter()
+    assert think.feed("<thi") == ""
+    assert think.feed("nk>секрет</think>Ответ") == "Ответ"
+    assert think.take_reasoning() == "секрет"
+
+    class _Chunks:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def raise_for_status(self):
+            return None
+
+        def close(self):
+            return None
+
+        def json(self):
+            return {}
+
+        def iter_content(self, chunk_size=None):
+            yield self._raw
+
+    def stream(lines):
+        return _Chunks(("\n".join(lines) + "\n").encode("utf-8"))
+
+    def wait_idle(client, needle):
+        deadline = time.time() + 3
+        state = {}
+        while time.time() < deadline:
+            state = client.get("/api/state").json()
+            text = "\n".join(row["text"] for row in state["history"])
+            if needle in text and not state["status"]["busy"]:
+                return state
+            time.sleep(0.05)
+        raise AssertionError(needle)
+
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        _use_tmp(tmp)
+        app = create_app()
+        session = app.state.session
+        client = TestClient(app)
+        assert client.post("/api/worlds", json={"name": "Camp"}).status_code == 200
+        opened = client.get("/api/settings")
+        assert opened.json()["reasoning"] is False
+        assert opened.json()["reasoning_max_tokens"] == 1024
+        clamped = client.put("/api/settings", json={"reasoning_max_tokens": 10, "summary_enabled": False, "memory_enabled": False})
+        assert clamped.status_code == 200, clamped.text
+        assert clamped.json()["reasoning_max_tokens"] == 64
+        assert client.put("/api/settings", json={"reasoning_max_tokens": 999999}).json()["reasoning_max_tokens"] == 32768
+
+        off = session._api_payload(messages=[{"role": "user", "content": "ход"}], max_tokens=300, stream=True)
+        assert off["enable_thinking"] is False
+        assert off["no_thinking"] is True
+        assert off["reasoning"]["effort"] == "none"
+        assert off["reasoning"]["exclude"] is True
+        assert off["max_tokens"] == 300
+        assert "max_completion_tokens" not in off
+
+        class _Code:
+            def __init__(self, code):
+                self.status_code = code
+                self.ok = 200 <= code < 300
+
+            def close(self):
+                return None
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise api_stream.requests.HTTPError("bad")
+
+        posted = []
+
+        def fake_post(_url, json=None, headers=None, **_kwargs):
+            posted.append(json)
+            return _Code(400 if len(posted) == 1 else 200)
+
+        original = api_stream.requests.post
+        api_stream.requests.post = fake_post
+        try:
+            session.reasoning_max_tokens = 1500
+            allowed = session._api_payload(
+                messages=[{"role": "user", "content": "ход"}],
+                max_tokens=300,
+                stream=True,
+                allow_reasoning=True,
+            )
+            session._api_post(allowed, stream=True)
+        finally:
+            api_stream.requests.post = original
+            session.reasoning_max_tokens = 1024
+        assert posted[0]["enable_thinking"] is True
+        assert posted[0]["thinking"] == {"type": "enabled"}
+        assert posted[0]["reasoning"]["max_tokens"] == 1500
+        assert posted[0]["reasoning"]["effort"] == "medium"
+        assert posted[0]["reasoning"]["exclude"] is False
+        assert "no_thinking" not in posted[0]
+        assert posted[0]["max_tokens"] == 1800
+        assert posted[0]["max_completion_tokens"] == 1800
+        assert "<think>" not in (posted[0].get("stop") or [])
+        assert "enable_thinking" not in posted[1]
+        assert posted[1].get("reasoning_effort") != "none"
+        assert posted[1]["max_tokens"] == 1800
+
+        calls = []
+
+        def post(payload, **_kwargs):
+            calls.append(payload)
+            if payload.get("max_tokens") == 1:
+                return stream(["data: [DONE]"])
+            return stream(
+                [
+                    'data: {"choices":[{"delta":{"content":"<think>тайна</think>Ответ готов."}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        session._api_post = post
+        assert client.post("/api/turn", json={"text": "осмотреться"}).status_code == 200
+        quiet = wait_idle(client, "Ответ готов")
+        story = "\n".join(row["text"] for row in quiet["history"])
+        assert "тайна" not in story
+        assert all(not row.get("reasoning") for row in quiet["history"])
+        turn = next(item for item in calls if item.get("messages") and item["messages"][0].get("role") == "system")
+        assert turn["enable_thinking"] is False
+        assert turn["no_thinking"] is True
+        assert "<think>" in turn["stop"]
+        assert "без размышлений" in turn["messages"][0]["content"]
+        assert turn["max_tokens"] == 300
+
+        saved = client.put(
+            "/api/settings",
+            json={
+                "reasoning": True,
+                "reasoning_max_tokens": 1500,
+                "model": "thinker",
+                "active_api_preset": "Thinker",
+                "api_presets": [
+                    {
+                        "name": "Thinker",
+                        "api_url": "http://localhost:1234/v1/chat/completions",
+                        "api_key": "",
+                        "model": "thinker",
+                        "reasoning": True,
+                        "reasoning_max_tokens": 1500,
+                    },
+                    {
+                        "name": "Plain",
+                        "api_url": "http://localhost:9/v1/chat/completions",
+                        "api_key": "",
+                        "model": "plain",
+                        "reasoning": False,
+                        "reasoning_max_tokens": 256,
+                    },
+                ],
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["reasoning"] is True
+        assert saved.json()["reasoning_max_tokens"] == 1500
+        thinker = next(item for item in saved.json()["api_presets"] if item["name"] == "Thinker")
+        assert thinker["reasoning"] is True
+        assert thinker["reasoning_max_tokens"] == 1500
+        stored = json.loads((tmp / "settings.json").read_text(encoding="utf-8"))
+        assert stored["api_presets"][0]["reasoning"] is True
+        assert stored["reasoning_max_tokens"] == 1500
+
+        calls.clear()
+
+        def post_on(payload, **_kwargs):
+            calls.append(payload)
+            if payload.get("max_tokens") == 1:
+                return stream(["data: [DONE]"])
+            if payload.get("messages", [{}])[0].get("role") != "system":
+                return stream(['data: {"choices":[{"delta":{"content":"Кратко."}}]}', "data: [DONE]"])
+            return stream(
+                [
+                    'data: {"choices":[{"delta":{"reasoning_content":"сначала проверю дверь"}}]}',
+                    'data: {"choices":[{"delta":{"content":"<think>ещё мысль</think>Дверь открыта."}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        session._api_post = post_on
+        assert client.post("/api/turn", json={"text": "открыть дверь"}).status_code == 200
+        told = wait_idle(client, "Дверь открыта")
+        reply = next(row for row in told["history"] if row["text"] == "Дверь открыта.")
+        assert "сначала проверю дверь" in reply["reasoning"]
+        assert "ещё мысль" in reply["reasoning"]
+        assert "сначала проверю дверь" not in reply["text"]
+        assert "<think>" not in reply["text"]
+        notes = json.loads((tmp / "Camp" / "reasoning.json").read_text(encoding="utf-8"))
+        assert notes[str(reply["index"])]["text"].count("мысль") == 1
+        spoken = next(item for item in calls if item.get("messages") and item["messages"][0].get("role") == "system")
+        assert spoken["enable_thinking"] is True
+        assert "no_thinking" not in spoken
+        assert "<think>" not in spoken["stop"]
+        assert "без размышлений" not in spoken["messages"][0]["content"]
+        assert spoken["max_tokens"] == 300 + 1500
+        assert spoken["reasoning"]["max_tokens"] == 1500
+        assert "сначала проверю дверь" not in spoken["messages"][0]["content"]
+
+        assert client.post("/api/undo").status_code == 200
+        after_undo = client.get("/api/state").json()
+        assert all(row.get("text") != "Дверь открыта." for row in after_undo["history"])
+        assert "сначала проверю дверь" not in (tmp / "Camp" / "reasoning.json").read_text(encoding="utf-8")
+
+        def post_hidden(payload, **_kwargs):
+            calls.append(payload)
+            if payload.get("messages", [{}])[0].get("role") != "system":
+                return stream(['data: {"choices":[{"delta":{"content":"Кратко."}}]}', "data: [DONE]"])
+            return stream(
+                [
+                    'data: {"choices":[{"delta":{"content":"Тишина."}}]}',
+                    'data: {"usage":{"prompt_tokens":4,"completion_tokens":12,"completion_tokens_details":{"reasoning_tokens":9}}}',
+                    "data: [DONE]",
+                ]
+            )
+
+        calls.clear()
+        session._api_post = post_hidden
+        assert client.post("/api/turn", json={"text": "прислушаться"}).status_code == 200
+        hidden = wait_idle(client, "Тишина")
+        quiet_row = next(row for row in hidden["history"] if row["text"] == "Тишина.")
+        assert quiet_row["reasoning_hidden"] is True
+        assert "reasoning" not in quiet_row
+        follow = next(item for item in calls if item.get("messages") and item["messages"][0].get("role") == "system")
+        assert "сначала проверю дверь" not in follow["messages"][0]["content"]
+        assert "ещё мысль" not in follow["messages"][0]["content"]
+
+        def post_summary(payload, **_kwargs):
+            calls.append(payload)
+            return stream(['data: {"choices":[{"delta":{"content":"Кратко."}}]}', "data: [DONE]"])
+
+        calls.clear()
+        session._api_post = post_summary
+        assert client.post("/api/summary").status_code == 200
+        deadline = time.time() + 3
+        while time.time() < deadline and client.get("/api/state").json()["status"]["busy"]:
+            time.sleep(0.05)
+        assert calls
+        assert all(item["enable_thinking"] is False and item["no_thinking"] is True for item in calls)
+        assert all(item.get("max_tokens") != 300 + 1500 for item in calls)
+
+        plain = client.post("/api/presets/activate", json={"name": "Plain"})
+        assert plain.status_code == 200, plain.text
+        applied = client.get("/api/settings").json()
+        assert applied["reasoning"] is False
+        assert applied["reasoning_max_tokens"] == 256
+        assert applied["model"] == "plain"
+        again = client.post("/api/presets/activate", json={"name": "Thinker"})
+        assert again.status_code == 200, again.text
+        restored = client.get("/api/settings").json()
+        assert restored["reasoning"] is True
+        assert restored["reasoning_max_tokens"] == 1500
+    print("OK  рассуждение отделено от рассказа и выключается вместе с конфигурацией")
+
+
 def _wait_scene_image(client, timeout=4):
     deadline = time.time() + timeout
     scene = None
@@ -2300,4 +2584,5 @@ if __name__ == "__main__":
     test_sandbox_flags_enable_mechanics_without_moving_worlds()
     test_comfy_prompt_injection_and_a1111_payload()
     test_scene_image_api()
+    test_reasoning_stays_out_of_the_story()
     print("ALL WEB TESTS PASSED")
