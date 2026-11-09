@@ -268,6 +268,8 @@ TRANSLATIONS = {
         "cards.enter_title_first": "Сначала введите название карточки",
         "scene.prompt_label": "Промпт",
         "scene.negative_label": "Антипромпт",
+        "scene.wish": "Что показать",
+        "scene.wish_hint": "Пустое поле — кадр по последней сцене.",
         "scene.format": "Формат модели",
         "scene.look": "Стиль",
         "scene.copy_prompt": "Копировать промпт",
@@ -456,6 +458,10 @@ TRANSLATIONS = {
 
 Верни СТРОГО один JSON-объект без пояснений и без Markdown, с двумя полями:
 {{"prompt": "<текст промпта>", "negative_prompt": "<анти-промпт: что НЕ должно быть на изображении>"}}""",
+        "prompt.scene_wish": """Пожелание игрока к кадру:
+{wish}
+
+Изобрази это пожелание. Сохрани формат и стиль промпта выше. Не подменяй пожеланием всю сцену, если оно только уточняет кадр.""",
         "prompt.scene_style.sd": """Создай один подробный визуальный промпт для текущей сцены в формате Stable Diffusion / SDXL.
 
 ФОРМАТ: теги через запятую, как в тегах бустимилков (Danbooru). Порядок тегов: количество людей на рисунке (например 2girls, 1boy), главный объект, детали внешности, одежда и снаряжение, действие и поза, окружение, время суток и освещение, стиль и качество. Активно используй веса тегов. Вес тега указывай скобками: (красные волосы:1.2). Не используй точки, связные предложения и слова вроде «изображение», «фото», «рисунок».
@@ -759,6 +765,8 @@ TRANSLATIONS = {
         "cards.enter_title_first": "Please enter a card title first",
         "scene.prompt_label": "Prompt",
         "scene.negative_label": "Negative prompt",
+        "scene.wish": "What to show",
+        "scene.wish_hint": "Leave this empty to frame the latest scene.",
         "scene.format": "Model format",
         "scene.look": "Style",
         "scene.copy_prompt": "Copy prompt",
@@ -947,6 +955,10 @@ Content restrictions are lifted: NSFW, violence, blood and erotic elements are a
 
 Return STRICTLY a single JSON object, no explanations and no Markdown, with two fields:
 {{"prompt": "<prompt text>", "negative_prompt": "<negative prompt: what should NOT be in the image>"}}""",
+        "prompt.scene_wish": """The player's request for this frame:
+{wish}
+
+Show this request. Keep the prompt format and style above. Do not let the request replace the whole scene when it only adjusts the shot.""",
         "prompt.scene_style.sd": """Create one detailed visual prompt for the current scene in the Stable Diffusion / SDXL format.
 
 FORMAT: comma-separated tags in the style of booru (Danbooru) tags. Tag order: main subject, appearance details, clothing and gear, action and pose, environment, time of day and lighting, style and quality. Express tag weight with parentheses: (red hair:1.2). Do not use full sentences or words like "image", "photo", "painting".

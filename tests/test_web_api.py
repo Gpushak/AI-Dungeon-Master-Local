@@ -469,7 +469,7 @@ def test_state_is_not_cached():
         assert "no-store" in cache
         page = client.get("/")
         assert "no-store" in page.headers.get("cache-control", "")
-        assert "app.js?v=15" in page.text
+        assert "app.js?v=16" in page.text
         assert "style.css?v=16" in page.text
         assert 'rel="icon"' in page.text
         icon = client.get("/favicon.ico")
@@ -2274,6 +2274,146 @@ def test_scene_image_api():
     print("OK  картинка сцены сохраняется в мире и не читается снаружи папки")
 
 
+def test_scene_wish_changes_only_the_scene_prompt():
+    import tempfile
+
+    class _Chunks:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def raise_for_status(self):
+            return None
+
+        def close(self):
+            return None
+
+        def json(self):
+            return {}
+
+        def iter_content(self, chunk_size=None):
+            yield self._raw
+
+    def stream(lines):
+        return _Chunks(("\n".join(lines) + "\n").encode("utf-8"))
+
+    def scene_text(payload):
+        message = payload["messages"][0]
+        if message.get("role") == "user" and "текущей сцены" in message.get("content", ""):
+            return message["content"]
+        return ""
+
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        _use_tmp(tmp)
+        app = create_app()
+        session = app.state.session
+        client = TestClient(app)
+        assert client.put(
+            "/api/settings",
+            json={"summary_enabled": False, "memory_enabled": False, "image_auto": False},
+        ).status_code == 200
+        assert client.post("/api/worlds", json={"name": "Camp"}).status_code == 200
+        history = ["Игрок: осмотреться", "Мастер: Тропа вывела к реке."]
+        cards = {
+            "cards": [
+                {
+                    "id": "lamp",
+                    "title": "Старый фонарь",
+                    "triggers": ["wishlamp"],
+                    "description": "Медный фонарь висит у двери.",
+                }
+            ]
+        }
+        (tmp / "Camp" / "history.json").write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+        (tmp / "Camp" / "story_cards.json").write_text(json.dumps(cards, ensure_ascii=False), encoding="utf-8")
+        assert client.post("/api/worlds/open", json={"name": "Camp"}).status_code == 200
+        strings = client.get("/api/strings").json()
+        assert strings["scene.wish"] == "Что показать"
+        assert "prompt.scene_wish" not in {
+            item["key"] for group in client.get("/api/settings").json()["prompts"] for item in group["prompts"]
+        }
+
+        calls = []
+
+        def post(payload, **_kwargs):
+            calls.append(payload)
+            content = scene_text(payload)
+            if content:
+                raw = json.dumps({"prompt": "river path", "negative_prompt": "blurry"}, ensure_ascii=False)
+                line = "data: " + json.dumps({"choices": [{"delta": {"content": raw}}]}, ensure_ascii=False)
+                return stream([line, "data: [DONE]"])
+            if payload.get("max_tokens") == 1:
+                return stream(["data: [DONE]"])
+            return stream(['data: {"choices":[{"delta":{"content":"Тишина у реки."}}]}', "data: [DONE]"])
+
+        def wait_done(expected):
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if len(calls) >= expected and not client.get("/api/state").json()["status"]["busy"]:
+                    return
+                time.sleep(0.05)
+            raise AssertionError(f"ожидалось {expected} запросов, пришло {len(calls)}")
+
+        session._api_post = post
+        assert client.post("/api/scene", json={"image_prompt_style": "sd", "image_look": "none"}).status_code == 200
+        wait_done(1)
+        assert client.post("/api/scene", json={"wish": "   "}).status_code == 200
+        wait_done(2)
+        plain = scene_text(calls[0])
+        blank = scene_text(calls[1])
+        assert plain and plain == blank
+        assert "Пожелание игрока" not in plain
+        assert "Старый фонарь" not in plain
+        assert "wishlamp" not in plain
+
+        wish = "крупный план wishlamp у двери"
+        assert client.post("/api/scene", json={"wish": wish}).status_code == 200
+        wait_done(3)
+        asked = scene_text(calls[2])
+        assert "Пожелание игрока к кадру" in asked
+        assert wish in asked
+        assert "Старый фонарь" in asked
+        assert "Медный фонарь висит у двери." in asked
+        view = client.get("/api/scene").json()
+        assert view["wish"] == wish
+        assert view["scene"]["prompt"] == "river path"
+        assert wish not in view["scene"]["prompt"]
+
+        long_wish = ("А" * 2000) + "ХВОСТ"
+        assert client.post("/api/scene", json={"wish": long_wish}).status_code == 200
+        wait_done(4)
+        stored = client.get("/api/scene").json()["wish"]
+        assert stored == "А" * 2000
+        assert "ХВОСТ" not in scene_text(calls[3])
+        assert stored in scene_text(calls[3])
+
+        calls.clear()
+        assert client.post("/api/turn", json={"text": "идти вдоль реки"}).status_code == 200
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            state = client.get("/api/state").json()
+            if any(row["text"] == "Тишина у реки." for row in state["history"]) and not state["status"]["busy"]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("ход не завершился")
+        spoken = "\n".join(
+            message.get("content", "")
+            for payload in calls
+            for message in payload.get("messages", [])
+        )
+        assert "крупный план" not in spoken
+        assert "ХВОСТ" not in spoken
+        assert "А" * 200 not in spoken
+        camp = tmp / "Camp"
+        for name in ("history.json", "summary.txt", "memory.json", "plot_basics.txt"):
+            path = camp / name
+            if path.exists():
+                assert "крупный план" not in path.read_text(encoding="utf-8")
+        assert "крупный план" not in (tmp / "settings.json").read_text(encoding="utf-8")
+        print("OK  пустое пожелание не меняет промпт сцены, заполненное остаётся только в этом запросе")
+
+
 def test_reasoning_stays_out_of_the_story():
     import tempfile
 
@@ -2584,5 +2724,6 @@ if __name__ == "__main__":
     test_sandbox_flags_enable_mechanics_without_moving_worlds()
     test_comfy_prompt_injection_and_a1111_payload()
     test_scene_image_api()
+    test_scene_wish_changes_only_the_scene_prompt()
     test_reasoning_stays_out_of_the_story()
     print("ALL WEB TESTS PASSED")

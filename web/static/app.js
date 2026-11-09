@@ -1806,6 +1806,7 @@ async function renderScene(extra) {
   const scene = extra && extra.prompt != null ? extra : data.scene;
   let style = data.image_prompt_style || "sd";
   let look = data.image_look || "none";
+  let wishText = data.wish || "";
 
   function choiceRow(title, values, selected, labelPrefix, onPick) {
     const headingNode = document.createElement("p");
@@ -1861,7 +1862,7 @@ async function renderScene(extra) {
       const result = await api("/api/scene", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_prompt_style: style, image_look: look }),
+        body: JSON.stringify({ image_prompt_style: style, image_look: look, wish: wishText }),
       });
       if (result && result.ok === false) {
         note.className = "error";
@@ -1956,6 +1957,8 @@ async function renderScene(extra) {
       look = value;
       saveSceneOptions();
     }),
+    labeledBox(t("scene.wish"), 3, wishText, (value) => { wishText = value; }),
+    Object.assign(document.createElement("p"), { className: "hint", textContent: t("scene.wish_hint") }),
     labeledBox(t("scene.prompt_label"), 8, promptText, (value) => {
       promptText = value;
       rememberText();

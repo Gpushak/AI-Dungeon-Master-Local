@@ -388,6 +388,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self.summary_indexing = False
         self.scene_prompt_running = False
         self.scene_image_running = False
+        self.scene_wish = ""
         self._image_target = None
         self._schedule_summary_after_turn = False
         self._schedule_memory_after_turn = False
@@ -514,6 +515,9 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         recent = get_recent_turn_messages(self.history, SCENE_TURNS)
         history_fragment = "\n".join(localize_history(self.language, recent))
         query = "\n".join(recent)
+        wish = str(getattr(self, "scene_wish", "") or "").strip()
+        if wish:
+            query = f"{query}\n{wish}"
         cards = retrieve_relevant_cards(query, self.story_cards, top_k=self.memory_top_k)
         cards_block = format_story_cards_block(cards, self.language)
         return plot_basics, history_fragment, cards_block
@@ -858,7 +862,16 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "image_look": self.image_look,
             "image_looks": list(IMAGE_LOOKS),
             "image_backend": self.image_backend,
+            "wish": self.scene_wish,
         }
+
+    def set_scene_wish(self, text):
+        """Пожелание к кадру. Пустая строка возвращает обычную сборку промпта."""
+        cleaned = str(text or "").replace("\x00", "").strip()
+        if len(cleaned) > 2000:
+            cleaned = cleaned[:2000].rstrip()
+        self.scene_wish = cleaned
+        return self.scene_wish
 
     def update_scene_text(self, prompt, negative=""):
         """Запоминает правку промпта, не запуская генерацию и не перерисовывая панель."""
@@ -1843,6 +1856,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "scene.look",
             "scene.prompt_label",
             "scene.negative_label",
+            "scene.wish",
+            "scene.wish_hint",
             "world_file.introduction.txt",
             "world_file.ai_instructions.txt",
             "world_file.plot_basics.txt",

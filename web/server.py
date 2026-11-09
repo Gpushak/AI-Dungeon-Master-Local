@@ -379,6 +379,8 @@ def create_app(session: GameSession | None = None, bind_host: str = "127.0.0.1")
             raise HTTPException(409, "busy or no world")
         if isinstance(payload, dict):
             game().set_scene_options(payload.get("image_prompt_style"), payload.get("image_look"))
+            if "wish" in payload:
+                game().set_scene_wish(payload.get("wish"))
         started = game().start_scene_prompt()
         if started:
             return {"ok": True, "notice": ""}

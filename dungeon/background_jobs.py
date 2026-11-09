@@ -142,6 +142,9 @@ class JobsMixin:
         history_fragment = "\n".join(localize_history(self.language, recent))
 
         query = "\n".join(recent)
+        wish = str(getattr(self, "scene_wish", "") or "").strip()
+        if wish:
+            query = f"{query}\n{wish}"
         cards = retrieve_relevant_cards(query, self.story_cards, top_k=self.memory_top_k)
         cards_block = format_story_cards_block(cards, self.language)
         return plot_basics, history_fragment, cards_block
@@ -163,6 +166,9 @@ class JobsMixin:
             )
             if look != "none":
                 prompt += "\n\n" + t(self.language, f"prompt.scene_look.{look}")
+            wish = str(getattr(self, "scene_wish", "") or "").strip()
+            if wish:
+                prompt += "\n\n" + t(self.language, "prompt.scene_wish", wish=wish)
             payload = self._api_payload(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
