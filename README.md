@@ -26,7 +26,7 @@ The old desktop program is in [AIDM_Desktop](AIDM_Desktop/README.md). This brows
 ## Release
 
 1. From the repository root, run `build_web.ps1`.
-2. The script writes `App_web/` with `AIDM.exe` and an empty `worlds/` folder next to it.
+2. The script writes `App_web/` with `AIDM.exe`, an empty `worlds/` folder, and the samples from `Demo worlds`.
 3. Zip `App_web` and unpack that archive into any folder.
 4. Run `AIDM.exe`.
 5. Choose where the game should open: this computer, home Wi-Fi, or Tailscale.

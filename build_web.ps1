@@ -46,6 +46,12 @@ New-Item -ItemType Directory -Path $WorldsDest | Out-Null
 $WorkflowsDest = Join-Path $OutputDir "workflows"
 New-Item -ItemType Directory -Path $WorkflowsDest | Out-Null
 
+$DemoSrc = Join-Path $ProjectRoot "Demo worlds"
+if (-not (Test-Path -LiteralPath $DemoSrc)) {
+    throw "Demo worlds folder is missing: $DemoSrc"
+}
+Copy-Item -LiteralPath $DemoSrc -Destination $OutputDir -Recurse
+
 # Пустой шаблон, без ключей и чужих миров: эту папку можно класть в zip.
 @'
 {
@@ -80,4 +86,4 @@ New-Item -ItemType Directory -Path $WorkflowsDest | Out-Null
 '@ | Set-Content -Path (Join-Path $WorldsDest "settings.json") -Encoding UTF8
 
 Write-Host "Done: $OutputDir\AIDM.exe"
-Write-Host "Zip the App_web folder. Worlds stay next to AIDM.exe."
+Write-Host "Zip the App_web folder. Worlds and Demo worlds stay next to AIDM.exe."
