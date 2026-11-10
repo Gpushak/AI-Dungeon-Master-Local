@@ -224,7 +224,6 @@ function reasoningBlock(text, hidden, live) {
   if (!text && !hidden && !live) return null;
   const details = document.createElement("details");
   details.className = "reasoning";
-  if (live) details.open = true;
   const summary = document.createElement("summary");
   summary.textContent = t("log.reasoning");
   const body = document.createElement("div");
