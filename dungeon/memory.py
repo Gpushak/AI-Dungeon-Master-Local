@@ -56,18 +56,46 @@ def get_turn_messages(history, turn_start, turn_end):
     return messages
 
 
-def get_recent_turn_messages(history, last_n):
-    """Последние n завершённых ходов (ход игрока + ответ мастера), по порядку."""
+def _completed_turns(history):
     turns = []
     i = 0
     while i < len(history):
-        if history[i].startswith(PLAYER_PREFIX):
-            if i + 1 < len(history) and history[i + 1].startswith(DM_PREFIX):
-                turns.append([history[i], history[i + 1]])
+        if str(history[i]).startswith(PLAYER_PREFIX):
+            if i + 1 < len(history) and str(history[i + 1]).startswith(DM_PREFIX):
+                turns.append((history[i], history[i + 1]))
                 i += 2
                 continue
         i += 1
-    return [msg for turn in turns[-last_n:] for msg in turn]
+    return turns
+
+
+def get_recent_turn_messages(history, last_n):
+    """Последние n завершённых ходов (ход игрока + ответ мастера), по порядку."""
+    return [msg for turn in _completed_turns(history)[-last_n:] for msg in turn]
+
+
+def recent_turns_within_tokens(history, token_budget, token_counter):
+    """Последние завершённые ходы, пока оценка токенов не выйдет за бюджет.
+
+    Новый ход входит даже один, если он сам больше бюджета: иначе кадр
+    остался бы без текущей сцены.
+    """
+    try:
+        budget = int(token_budget)
+    except (TypeError, ValueError):
+        budget = 1
+    if budget < 1:
+        budget = 1
+    chosen = []
+    used = 0
+    for turn in reversed(_completed_turns(history)):
+        cost = sum(int(token_counter(msg)) + 1 for msg in turn)
+        if chosen and used + cost > budget:
+            break
+        chosen.append(turn)
+        used += cost
+    chosen.reverse()
+    return [msg for turn in chosen for msg in turn]
 
 
 def retrieve_relevant_memories(query, bank, top_k=5, min_score=1):

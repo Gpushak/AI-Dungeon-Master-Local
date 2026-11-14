@@ -237,6 +237,22 @@ def clamp_reasoning_max_tokens(value, default=1024):
     return min(32768, max(64, number))
 
 
+TASK_PRESET_ROLES = ("summary", "memory", "scene", "cards")
+
+
+def normalize_task_presets(value, preset_names=()):
+    """Пустое имя роли означает основную конфигурацию. Чужое имя к ней же возвращается."""
+    raw = value if isinstance(value, dict) else {}
+    known = {str(name) for name in preset_names if str(name).strip()}
+    cleaned = {}
+    for role in TASK_PRESET_ROLES:
+        chosen = str(raw.get(role) or "").strip()
+        if chosen not in known:
+            chosen = ""
+        cleaned[role] = chosen
+    return cleaned
+
+
 def normalize_api_presets(presets):
     if not isinstance(presets, list):
         return []
@@ -310,6 +326,10 @@ def load_global_settings():
     defaults["prompt_overrides"] = normalize_prompt_overrides(defaults.get("prompt_overrides"))
     defaults["reasoning"] = flag_value(defaults.get("reasoning", False))
     defaults["reasoning_max_tokens"] = clamp_reasoning_max_tokens(defaults.get("reasoning_max_tokens", 1024))
+    defaults["task_presets"] = normalize_task_presets(
+        defaults.get("task_presets"),
+        [item["name"] for item in defaults["api_presets"]],
+    )
     return defaults
 
 

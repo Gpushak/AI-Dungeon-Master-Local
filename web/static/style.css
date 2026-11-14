@@ -403,6 +403,8 @@ dialog header { flex: 0 0 auto; }
 }
 .cards-layout .card-list { max-height: 52vh; }
 .hint { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.hint.ok { color: var(--player); }
+.hint.warn { color: var(--gold); }
 dialog button.danger { background: var(--danger); color: white; border-color: transparent; }
 dialog button.primary { background: var(--gold); color: #1a140c; border: 0; font-weight: 700; }
 .world-list button[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); }

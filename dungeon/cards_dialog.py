@@ -307,13 +307,14 @@ class CardsMixin:
 
         def run_generation():
             try:
-                payload = self._api_payload(
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    max_tokens=response_token_limit(getattr(self, "response_limits", None), "prompt.card_desc_gen"),
-                    stream=True,
-                )
-                response = self._api_post(payload, stream=True, timeout=120)
+                with self._use_task_preset("cards"):
+                    payload = self._api_payload(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=response_token_limit(getattr(self, "response_limits", None), "prompt.card_desc_gen"),
+                        stream=True,
+                    )
+                    response = self._api_post(payload, stream=True, timeout=120)
                 response.raise_for_status()
                 generated_desc, cancelled = self._read_response(response, CARDS)
 

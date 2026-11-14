@@ -56,6 +56,12 @@ class DungeonApp(DialogMixin, AIEngineMixin, ChatMixin, SessionMixin):
         self.model = settings.get("model", "")
         self.active_api_preset = settings.get("active_api_preset", "")
         self.api_presets = settings.get("api_presets", [])
+        self.task_presets = settings.get("task_presets") or {
+            "summary": "",
+            "memory": "",
+            "scene": "",
+            "cards": "",
+        }
         self.reasoning = flag_value(settings.get("reasoning", False))
         self.reasoning_max_tokens = clamp_reasoning_max_tokens(settings.get("reasoning_max_tokens", 1024))
         self.temperature = settings["temperature"]
@@ -185,6 +191,7 @@ class DungeonApp(DialogMixin, AIEngineMixin, ChatMixin, SessionMixin):
                 "prompt_overrides": self.prompt_overrides,
                 "reasoning": bool(self.reasoning),
                 "reasoning_max_tokens": self.reasoning_max_tokens,
+                "task_presets": self.task_presets,
             }
         )
 

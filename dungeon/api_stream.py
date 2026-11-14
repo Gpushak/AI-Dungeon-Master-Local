@@ -1,6 +1,7 @@
 import codecs
 import json
 import time
+from contextlib import contextmanager
 from threading import Event
 
 import requests
@@ -269,6 +270,32 @@ class ApiMixin:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+
+    def _task_preset(self, role):
+        """Сохранённая конфигурация функции. Пустое значение — основная."""
+        chosen = str((getattr(self, "task_presets", {}) or {}).get(role) or "").strip()
+        if not chosen:
+            return None
+        for item in getattr(self, "api_presets", []) or []:
+            if isinstance(item, dict) and item.get("name") == chosen:
+                return item
+        return None
+
+    @contextmanager
+    def _use_task_preset(self, role):
+        """На время запроса подменяет адрес, ключ и модель. Рассуждение не включает."""
+        found = self._task_preset(role)
+        if not found:
+            yield
+            return
+        saved = (self.api_url, self.api_key, self.model)
+        self.api_url = str(found.get("api_url") or "")
+        self.api_key = str(found.get("api_key") or "")
+        self.model = str(found.get("model") or "")
+        try:
+            yield
+        finally:
+            self.api_url, self.api_key, self.model = saved
 
     def _api_payload(self, **fields):
         allow_reasoning = bool(fields.pop("allow_reasoning", False))

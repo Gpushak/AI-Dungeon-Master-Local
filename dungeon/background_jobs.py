@@ -18,8 +18,10 @@ from .memory import (
     get_recent_turn_messages,
     get_turn_messages,
     parse_memory_index_response,
+    recent_turns_within_tokens,
     save_memory_bank,
 )
+from .tokens import count_tokens
 from .story_cards import format_story_cards_block, retrieve_relevant_cards
 
 
@@ -64,13 +66,14 @@ class JobsMixin:
             fallback_text = "\n".join(localize_history(self.language, messages))
             prompt = t(self.language, "prompt.memory_index", fragment=fallback_text)
 
-            payload = self._api_payload(
-                messages=[{"role": "user", "content": prompt + "\n\n" + t(self.language, "prompt.no_reasoning")}],
-                temperature=0.2,
-                max_tokens=response_token_limit(getattr(self, "response_limits", None), "prompt.memory_index"),
-                stream=True,
-            )
-            response = self._api_post(payload, stream=True, timeout=120)
+            with self._use_task_preset("memory"):
+                payload = self._api_payload(
+                    messages=[{"role": "user", "content": prompt + "\n\n" + t(self.language, "prompt.no_reasoning")}],
+                    temperature=0.2,
+                    max_tokens=response_token_limit(getattr(self, "response_limits", None), "prompt.memory_index"),
+                    stream=True,
+                )
+                response = self._api_post(payload, stream=True, timeout=120)
             response.raise_for_status()
             raw, cancelled = self._read_response(response, MEMORY)
             if cancelled:
@@ -138,7 +141,8 @@ class JobsMixin:
                 if content:
                     plot_basics += f"=== {fname} ===\n{content}\n"
 
-        recent = get_recent_turn_messages(self.history, SCENE_TURNS)
+        budget = max(1, int(getattr(self, "context_size", 0) or 0) // 2)
+        recent = recent_turns_within_tokens(self.history, budget, count_tokens)
         history_fragment = "\n".join(localize_history(self.language, recent))
 
         query = "\n".join(recent)
@@ -169,13 +173,14 @@ class JobsMixin:
             wish = str(getattr(self, "scene_wish", "") or "").strip()
             if wish:
                 prompt += "\n\n" + t(self.language, "prompt.scene_wish", wish=wish)
-            payload = self._api_payload(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=response_token_limit(getattr(self, "response_limits", None), "prompt.scene_image"),
-                stream=True,
-            )
-            response = self._api_post(payload, stream=True, timeout=120)
+            with self._use_task_preset("scene"):
+                payload = self._api_payload(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=response_token_limit(getattr(self, "response_limits", None), "prompt.scene_image"),
+                    stream=True,
+                )
+                response = self._api_post(payload, stream=True, timeout=120)
             response.raise_for_status()
             raw, cancelled = self._read_response(response, SCENE)
             if cancelled:

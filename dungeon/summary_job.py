@@ -173,13 +173,14 @@ class SummaryMixin:
                 history=history_text,
             ) + compress_note
 
-            payload = self._api_payload(
-                messages=[{"role": "user", "content": prompt + "\n\n" + t(self.language, "prompt.no_reasoning")}],
-                temperature=0.3,
-                max_tokens=summary_max_tokens,
-                stream=True,
-            )
-            response = self._api_post(payload, stream=True, timeout=240)
+            with self._use_task_preset("summary"):
+                payload = self._api_payload(
+                    messages=[{"role": "user", "content": prompt + "\n\n" + t(self.language, "prompt.no_reasoning")}],
+                    temperature=0.3,
+                    max_tokens=summary_max_tokens,
+                    stream=True,
+                )
+                response = self._api_post(payload, stream=True, timeout=240)
             response.raise_for_status()
             new_summary, cancelled = self._read_response(response, SUMMARY)
             if cancelled:

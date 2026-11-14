@@ -469,8 +469,8 @@ def test_state_is_not_cached():
         assert "no-store" in cache
         page = client.get("/")
         assert "no-store" in page.headers.get("cache-control", "")
-        assert "app.js?v=17" in page.text
-        assert "style.css?v=16" in page.text
+        assert "app.js?v=19" in page.text
+        assert "style.css?v=17" in page.text
         assert 'rel="icon"' in page.text
         icon = client.get("/favicon.ico")
         assert icon.status_code == 200
@@ -2414,6 +2414,192 @@ def test_scene_wish_changes_only_the_scene_prompt():
         print("OK  пустое пожелание не меняет промпт сцены, заполненное остаётся только в этом запросе")
 
 
+def test_task_presets_and_scene_history_budget():
+    import tempfile
+
+    from dungeon.tokens import count_tokens
+
+    class _Chunks:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def raise_for_status(self):
+            return None
+
+        def close(self):
+            return None
+
+        def json(self):
+            return {}
+
+        def iter_content(self, chunk_size=None):
+            yield self._raw
+
+    def stream(text):
+        line = "data: " + json.dumps({"choices": [{"delta": {"content": text}}]}, ensure_ascii=False)
+        return _Chunks((line + "\ndata: [DONE]\n").encode("utf-8"))
+
+    old_player, old_dm = "Игрок: OLD_MARKER_SCENE", "Мастер: старая заводь"
+    new_player, new_dm = "Игрок: NEW_MARKER_SCENE", "Мастер: новая река у камня"
+    filler = ("Игрок: идти дальше", "Мастер: Тропа тянется между соснами.")
+    history = [old_player, old_dm] + [part for _ in range(12) for part in filler] + [new_player, new_dm]
+    newest = count_tokens(new_player) + 1 + count_tokens(new_dm) + 1
+
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        _use_tmp(tmp)
+        app = create_app()
+        session = app.state.session
+        client = TestClient(app)
+        assert client.post("/api/worlds", json={"name": "Camp"}).status_code == 200
+        opened = client.get("/api/settings").json()
+        assert opened["task_presets"] == {"summary": "", "memory": "", "scene": "", "cards": ""}
+        assert client.get("/api/strings").json()["dialog.task_main"] == "Основная"
+        saved = client.put(
+            "/api/settings",
+            json={
+                "api_url": "http://main.example/v1/chat/completions",
+                "model": "main-model",
+                "active_api_preset": "Main",
+                "api_presets": [
+                    {
+                        "name": "Main",
+                        "api_url": "http://main.example/v1/chat/completions",
+                        "api_key": "",
+                        "model": "main-model",
+                    },
+                    {
+                        "name": "Painter",
+                        "api_url": "http://painter.example/v1/chat/completions",
+                        "api_key": "paint-key",
+                        "model": "painter-model",
+                    },
+                    {
+                        "name": "Scribe",
+                        "api_url": "http://scribe.example/v1/chat/completions",
+                        "api_key": "",
+                        "model": "scribe-model",
+                    },
+                ],
+                "task_presets": {
+                    "summary": "Scribe",
+                    "memory": "Нет такой",
+                    "scene": "Painter",
+                    "cards": "Painter",
+                },
+                "summary_enabled": False,
+                "memory_enabled": False,
+                "image_auto": False,
+                "context_size": newest * 2,
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        tasks = saved.json()["task_presets"]
+        assert tasks["scene"] == "Painter"
+        assert tasks["summary"] == "Scribe"
+        assert tasks["cards"] == "Painter"
+        assert tasks["memory"] == ""
+        stored = json.loads((tmp / "settings.json").read_text(encoding="utf-8"))
+        assert stored["task_presets"]["scene"] == "Painter"
+        assert stored["task_presets"]["memory"] == ""
+
+        (tmp / "Camp" / "history.json").write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+        assert client.post("/api/worlds/open", json={"name": "Camp"}).status_code == 200
+        session.context_size = newest * 2
+        calls = []
+
+        def post(payload, **_kwargs):
+            calls.append(
+                {
+                    "model": payload.get("model"),
+                    "url": session.api_url,
+                    "key": session.api_key,
+                    "content": payload["messages"][0]["content"],
+                    "max_tokens": payload.get("max_tokens"),
+                }
+            )
+            content = payload["messages"][0]["content"]
+            if "текущей сцены" in content:
+                return stream('{"prompt": "river path", "negative_prompt": "blurry"}')
+            if payload.get("max_tokens") == 1:
+                return _Chunks(b"data: [DONE]\n")
+            return stream("Готово.")
+
+        def wait_scene(expected):
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if len(calls) >= expected and not client.get("/api/state").json()["status"]["busy"]:
+                    return
+                time.sleep(0.05)
+            raise AssertionError(f"ожидалось {expected} запросов, пришло {len(calls)}")
+
+        session._api_post = post
+        assert client.post("/api/scene", json={"wish": ""}).status_code == 200
+        wait_scene(1)
+        scene_call = calls[-1]
+        assert scene_call["model"] == "painter-model"
+        assert scene_call["url"] == "http://painter.example/v1/chat/completions"
+        assert scene_call["key"] == "paint-key"
+        assert "NEW_MARKER_SCENE" in scene_call["content"]
+        assert "OLD_MARKER_SCENE" not in scene_call["content"]
+        assert session.model == "main-model"
+        assert session.api_url == "http://main.example/v1/chat/completions"
+        assert session.api_key == ""
+
+        session.context_size = 200000
+        assert client.post("/api/scene", json={"wish": ""}).status_code == 200
+        wait_scene(2)
+        wide = calls[-1]["content"]
+        assert "OLD_MARKER_SCENE" in wide
+        assert "NEW_MARKER_SCENE" in wide
+        assert calls[-1]["model"] == "painter-model"
+        assert session.model == "main-model"
+
+        calls.clear()
+        session.task_presets["memory"] = "Scribe"
+        session._run_memory_indexing_impl(True)
+        memory_call = next(item for item in calls if "Проанализируй фрагмент" in item["content"])
+        assert memory_call["model"] == "scribe-model"
+        assert memory_call["url"] == "http://scribe.example/v1/chat/completions"
+        assert session.model == "main-model"
+
+        calls.clear()
+        session._generate_global_summary_impl()
+        summary_call = next(item for item in calls if "Перед тобой история" in item["content"])
+        assert summary_call["model"] == "scribe-model"
+        assert session.model == "main-model"
+        assert session.api_url == "http://main.example/v1/chat/completions"
+
+        calls.clear()
+        assert session.describe_card("Фонарь", "старый фонарь у двери") is True
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if any("Фонарь" in item["content"] for item in calls) and not client.get("/api/state").json()["status"]["busy"]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("описание карточки не ушло в модель")
+        card_call = next(item for item in calls if "Фонарь" in item["content"])
+        assert card_call["model"] == "painter-model"
+        assert card_call["url"] == "http://painter.example/v1/chat/completions"
+        assert session.model == "main-model"
+
+        calls.clear()
+        assert client.post("/api/turn", json={"text": "осмотреться"}).status_code == 200
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            state = client.get("/api/state").json()
+            if any(row["text"] == "Готово." for row in state["history"]) and not state["status"]["busy"]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("ход не завершился")
+        assert calls
+        assert all(item["model"] == "main-model" for item in calls)
+        assert all(item["url"] == "http://main.example/v1/chat/completions" for item in calls)
+        print("OK  функции берут свою конфигурацию, промпт сцены видит половину контекста")
+
+
 def test_reasoning_stays_out_of_the_story():
     import tempfile
 
@@ -2725,5 +2911,6 @@ if __name__ == "__main__":
     test_comfy_prompt_injection_and_a1111_payload()
     test_scene_image_api()
     test_scene_wish_changes_only_the_scene_prompt()
+    test_task_presets_and_scene_history_budget()
     test_reasoning_stays_out_of_the_story()
     print("ALL WEB TESTS PASSED")

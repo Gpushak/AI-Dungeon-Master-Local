@@ -55,6 +55,7 @@ from dungeon.memory import (
     count_completed_turns,
     format_memory_block,
     get_recent_turn_messages,
+    recent_turns_within_tokens,
     load_memory_bank,
     retrieve_relevant_memories,
     save_memory_bank,
@@ -91,6 +92,7 @@ from dungeon.storage import (
     load_reasoning_notes,
     load_world_config,
     normalize_api_presets,
+    normalize_task_presets,
     save_reasoning_notes,
     shift_reasoning_notes,
     save_global_settings,
@@ -341,6 +343,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
         self._restore_token_scale(self.model)
         self.active_api_preset = settings.get("active_api_preset", "")
         self.api_presets = settings.get("api_presets", [])
+        self.task_presets = normalize_task_presets(
+            settings.get("task_presets"),
+            [item["name"] for item in self.api_presets if isinstance(item, dict)],
+        )
         self.temperature = settings["temperature"]
         self.max_tokens = settings["max_tokens"]
         self.context_size = settings["context_size"]
@@ -512,7 +518,8 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             content = world_file_text(world_path, fname).strip()
             if content:
                 plot_basics += f"=== {fname} ===\n{content}\n"
-        recent = get_recent_turn_messages(self.history, SCENE_TURNS)
+        budget = max(1, int(getattr(self, "context_size", 0) or 0) // 2)
+        recent = recent_turns_within_tokens(self.history, budget, count_tokens)
         history_fragment = "\n".join(localize_history(self.language, recent))
         query = "\n".join(recent)
         wish = str(getattr(self, "scene_wish", "") or "").strip()
@@ -1491,6 +1498,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                 "token_scales": self.token_scales,
                 "reasoning": bool(self.reasoning),
                 "reasoning_max_tokens": self.reasoning_max_tokens,
+                "task_presets": self.task_presets,
             }
         )
 
@@ -1555,6 +1563,7 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "sandbox_npc": bool(self.sandbox_npc),
             "reasoning": bool(self.reasoning),
             "reasoning_max_tokens": self.reasoning_max_tokens,
+            "task_presets": dict(self.task_presets),
             "prompts": groups,
             "prompt_overrides": self.prompt_overrides,
         }
@@ -1609,6 +1618,12 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             self.reasoning = flag_value(payload.get("reasoning"), self.reasoning)
         if "reasoning_max_tokens" in payload:
             self.reasoning_max_tokens = clamp_reasoning_max_tokens(payload.get("reasoning_max_tokens"))
+        if "task_presets" in payload or "api_presets" in payload:
+            incoming = payload.get("task_presets", self.task_presets)
+            self.task_presets = normalize_task_presets(
+                incoming,
+                [item["name"] for item in self.api_presets if isinstance(item, dict)],
+            )
         if not self.lan_access:
             self.bind_mode = "local"
         elif self.bind_mode == "local":
@@ -1815,6 +1830,12 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "dialog.temperature",
             "dialog.max_tokens",
             "dialog.context_size",
+            "dialog.task_presets",
+            "dialog.task_main",
+            "dialog.task_summary",
+            "dialog.task_memory",
+            "dialog.task_scene",
+            "dialog.task_cards",
             "dialog.gen_params",
             "dialog.stream",
             "dialog.section_summary",
@@ -1891,6 +1912,10 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
             "status.scene_prompt",
             "status.scene_image",
             "dialog.busy",
+            "dialog.saved",
+            "dialog.nothing_to_save",
+            "dialog.unsaved",
+            "dialog.unsaved_confirm",
             "dialog.no_world",
             "dialog.no_prompt",
             "dialog.prompt_time",
@@ -2297,13 +2322,14 @@ class GameSession(SharedTurnMixin, AIEngineMixin):
                     author_notes=author_notes or self.tr("prompt.none"),
                     history_fragment=history_fragment or self.tr("prompt.none"),
                 )
-                payload = self._api_payload(
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    max_tokens=card_limit,
-                    stream=True,
-                )
-                response = self._api_post(payload, stream=True, timeout=120)
+                with self._use_task_preset("cards"):
+                    payload = self._api_payload(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=card_limit,
+                        stream=True,
+                    )
+                    response = self._api_post(payload, stream=True, timeout=120)
                 response.raise_for_status()
                 generated, cancelled = self._read_response(response, CARDS)
                 if not cancelled:

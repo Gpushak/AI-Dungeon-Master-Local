@@ -150,6 +150,158 @@ function paintNotice(text) {
   noticeEl.hidden = !text;
 }
 
+let panelGuard = null;
+let settingsBaseline = null;
+let refreshSettingsStatus = null;
+
+function armPanelGuard(isDirty) {
+  panelGuard = isDirty;
+}
+
+let settingsFormTouch = null;
+
+function unbindSettingsTouch() {
+  if (!settingsFormTouch) return;
+  panelBody.removeEventListener("input", settingsFormTouch);
+  panelBody.removeEventListener("change", settingsFormTouch);
+  settingsFormTouch = null;
+}
+
+function releasePanelGuard() {
+  panelGuard = null;
+  refreshSettingsStatus = null;
+  unbindSettingsTouch();
+}
+
+function confirmDiscard() {
+  if (!panelGuard || !panelGuard()) return true;
+  return window.confirm(t("dialog.unsaved_confirm"));
+}
+
+function statusLine() {
+  const node = document.createElement("p");
+  node.className = "hint";
+  node.hidden = true;
+  node.setAttribute("role", "status");
+  let mode = "";
+  return {
+    node,
+    saved() {
+      mode = "saved";
+      node.hidden = false;
+      node.className = "hint ok";
+      node.textContent = t("dialog.saved");
+    },
+    unchanged() {
+      mode = "saved";
+      node.hidden = false;
+      node.className = "hint";
+      node.textContent = t("dialog.nothing_to_save");
+    },
+    error(text) {
+      mode = "error";
+      node.hidden = false;
+      node.className = "error";
+      node.textContent = text;
+    },
+    settle(dirty) {
+      if (dirty) {
+        mode = "dirty";
+        node.hidden = false;
+        node.className = "hint warn";
+        node.textContent = t("dialog.unsaved");
+        return;
+      }
+      if (mode === "dirty" || mode === "error") {
+        mode = "";
+        node.hidden = true;
+        node.className = "hint";
+        node.textContent = "";
+      }
+    },
+  };
+}
+
+function settingsFingerprint(cache) {
+  const preset = (cache.api_presets || []).map((item) => ({
+    name: item.name || "",
+    api_url: item.api_url || "",
+    api_key: item.api_key || "",
+    model: item.model || "",
+    reasoning: Boolean(item.reasoning),
+    reasoning_max_tokens: Number(item.reasoning_max_tokens) || 1024,
+  }));
+  const tasks = Object.assign({ summary: "", memory: "", scene: "", cards: "" }, cache.task_presets || {});
+  const overrides = {};
+  const source = cache.prompt_overrides || {};
+  for (const lang of ["ru", "en"]) {
+    const bucket = source[lang] || {};
+    overrides[lang] = {};
+    for (const key of Object.keys(bucket).sort()) overrides[lang][key] = bucket[key] || "";
+  }
+  const limits = {};
+  for (const key of Object.keys(cache.response_limits || {}).sort()) limits[key] = cache.response_limits[key];
+  return JSON.stringify({
+    api_url: cache.api_url || "",
+    api_key: cache.api_key || "",
+    model: cache.model || "",
+    active_api_preset: cache.active_api_preset || "",
+    api_presets: preset,
+    temperature: Number(cache.temperature),
+    max_tokens: Number(cache.max_tokens),
+    context_size: Number(cache.context_size),
+    summary_fill_percent: Number(cache.summary_fill_percent),
+    memory_interval: Number(cache.memory_interval),
+    memory_top_k: Number(cache.memory_top_k),
+    stream_mode: Boolean(cache.stream_mode),
+    summary_enabled: Boolean(cache.summary_enabled),
+    memory_enabled: Boolean(cache.memory_enabled),
+    image_prompt_style: cache.image_prompt_style || "",
+    image_look: cache.image_look || "",
+    image_backend: cache.image_backend || "",
+    comfy_url: cache.comfy_url || "",
+    a1111_url: cache.a1111_url || "",
+    comfy_workflow: cache.comfy_workflow || "",
+    image_width: Number(cache.image_width),
+    image_height: Number(cache.image_height),
+    image_steps: Number(cache.image_steps),
+    image_auto: Boolean(cache.image_auto),
+    image_send_negative: Boolean(cache.image_send_negative),
+    response_limits: limits,
+    language: cache.language || "",
+    prompt_overrides: overrides,
+    lan_access: Boolean(cache.lan_access),
+    reasoning: Boolean(cache.reasoning),
+    reasoning_max_tokens: Number(cache.reasoning_max_tokens) || 1024,
+    task_presets: {
+      summary: tasks.summary || "",
+      memory: tasks.memory || "",
+      scene: tasks.scene || "",
+      cards: tasks.cards || "",
+    },
+    sandbox_d20: Boolean(cache.sandbox_d20),
+    sandbox_hero: Boolean(cache.sandbox_hero),
+    sandbox_npc: Boolean(cache.sandbox_npc),
+  });
+}
+
+function rememberSettings() {
+  if (!settingsCache) return;
+  settingsBaseline = settingsFingerprint(settingsCache);
+}
+
+function settingsDirty() {
+  if (settingsBaseline == null || !settingsCache) return false;
+  return settingsFingerprint(settingsCache) !== settingsBaseline;
+}
+
+function patchSettingsBaseline(patch) {
+  if (settingsBaseline == null) return;
+  const saved = JSON.parse(settingsBaseline);
+  Object.assign(saved, patch);
+  settingsBaseline = JSON.stringify(saved);
+}
+
 function paintMeters(meters) {
   if (!meters) return;
   const summaryBtn = document.querySelector("#toggle-summary");
@@ -403,6 +555,15 @@ async function selectPreset(name) {
     settingsCache.model = found.model || "";
     settingsCache.reasoning = Boolean(found.reasoning);
     settingsCache.reasoning_max_tokens = Number(found.reasoning_max_tokens) || 1024;
+    patchSettingsBaseline({
+      active_api_preset: settingsCache.active_api_preset || "",
+      api_url: settingsCache.api_url || "",
+      api_key: "",
+      model: settingsCache.model || "",
+      reasoning: Boolean(settingsCache.reasoning),
+      reasoning_max_tokens: Number(settingsCache.reasoning_max_tokens) || 1024,
+    });
+    if (refreshSettingsStatus) refreshSettingsStatus();
     const preset = document.querySelector("#settings-preset");
     if (preset) preset.value = found.name;
     for (const key of ["api_url", "model", "reasoning_max_tokens"]) {
@@ -1133,6 +1294,7 @@ document.querySelector("#lang").addEventListener("click", async () => {
     if (settingsCache) {
       settingsCache.language = updated.language;
       settingsCache.prompts = updated.prompts;
+      patchSettingsBaseline({ language: updated.language });
     }
     strings = await api("/api/strings");
     applyStrings();
@@ -1146,13 +1308,31 @@ document.querySelector("#lang").addEventListener("click", async () => {
   }
 });
 
-document.querySelector("#panel-close").addEventListener("click", () => panel.close());
+document.querySelector("#panel-close").addEventListener("click", () => {
+  if (!confirmDiscard()) return;
+  releasePanelGuard();
+  panel.close();
+});
+panel.addEventListener("cancel", (event) => {
+  if (!confirmDiscard()) {
+    event.preventDefault();
+    return;
+  }
+  releasePanelGuard();
+});
+window.addEventListener("beforeunload", (event) => {
+  if (!panelGuard || !panelGuard()) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 
 function editableRows() {
   return (state.history || []).filter((row) => row.kind === "player" || row.kind === "dm");
 }
 
 function openEditor(index) {
+  if (panel.open && !confirmDiscard()) return;
+  releasePanelGuard();
   const rows = editableRows().map((row) => ({ index: row.index, kind: row.kind, text: row.text, draft: row.text }));
   let pos = rows.findIndex((row) => row.index === index);
   if (pos < 0) pos = rows.length - 1;
@@ -1228,6 +1408,8 @@ async function editRow(row) {
 }
 
 function openPanel(name, extra) {
+  if (panel.open && !confirmDiscard()) return;
+  releasePanelGuard();
   panel.dataset.panel = name;
   applyCardDescription = null;
   panelTitle.textContent = t(`btn.${name === "settings" ? "ai_settings" : name === "files" ? "world_files" : name === "scene" ? "scene_prompt" : name}`);
@@ -1266,8 +1448,26 @@ function mountCardEditor(host, cardsData, options) {
   const triggers = document.createElement("input");
   triggers.type = "text";
   triggers.placeholder = t("cards.triggers_ph");
-  const note = document.createElement("p");
-  note.className = "error";
+  const status = statusLine();
+  let savedCards = "";
+  function cardSignature(list) {
+    return JSON.stringify(list.map((card) => ({
+      id: card.id || "",
+      title: String(card.title || ""),
+      description: asText(card.description),
+      triggers: (card.triggers || []).map(asText),
+    })));
+  }
+  function cardsDirty() {
+    read();
+    return cardSignature(cards) !== savedCards;
+  }
+  function touchCards() {
+    if (!saveEnabled) return;
+    const dirty = cardsDirty();
+    armPanelGuard(cardsDirty);
+    status.settle(dirty);
+  }
 
   function labeled(text, field, hint) {
     const wrap = document.createElement("div");
@@ -1329,6 +1529,7 @@ function mountCardEditor(host, cardsData, options) {
         current = item.index;
         write();
         draw();
+        touchCards();
       });
       list.append(button);
     }
@@ -1350,6 +1551,7 @@ function mountCardEditor(host, cardsData, options) {
     current = cards.length - 1;
     write();
     draw();
+    touchCards();
   });
   const del = document.createElement("button");
   del.type = "button";
@@ -1362,6 +1564,7 @@ function mountCardEditor(host, cardsData, options) {
     current = Math.max(0, current - 1);
     write();
     draw();
+    touchCards();
   });
   let pendingTitle = "";
   let pendingIndex = -1;
@@ -1369,9 +1572,8 @@ function mountCardEditor(host, cardsData, options) {
   gen.type = "button";
   gen.textContent = t("cards.generate_desc");
   gen.addEventListener("click", () => {
-    note.textContent = "";
     if (!title.value.trim()) {
-      note.textContent = t("cards.enter_title_first");
+      status.error(t("cards.enter_title_first"));
       return;
     }
     pendingTitle = title.value.trim();
@@ -1382,7 +1584,7 @@ function mountCardEditor(host, cardsData, options) {
       body: JSON.stringify({ title: title.value, description: desc.value }),
     }).catch((error) => {
       const detail = error && error.body && error.body.detail;
-      note.textContent = detail === "no world" || !(state && state.world) ? t("dialog.no_world") : t("dialog.busy");
+      status.error(detail === "no world" || !(state && state.world) ? t("dialog.no_world") : t("dialog.busy"));
     });
   });
   const save = document.createElement("button");
@@ -1391,6 +1593,10 @@ function mountCardEditor(host, cardsData, options) {
   save.textContent = t("btn.save");
   save.addEventListener("click", async () => {
     read();
+    if (!cardsDirty()) {
+      status.unchanged();
+      return;
+    }
     for (const card of cards) {
       if (!String(card.title || "").trim()) card.title = t("cards.untitled");
     }
@@ -1401,11 +1607,14 @@ function mountCardEditor(host, cardsData, options) {
         body: JSON.stringify({ cards }),
       });
       await refresh("keep");
+      savedCards = cardSignature(cards);
       write();
       draw();
+      status.saved();
+      armPanelGuard(cardsDirty);
     } catch (error) {
       const detail = error && error.body && error.body.detail;
-      note.textContent = detail === "no world" || !(state && state.world) ? t("dialog.no_world") : t("dialog.busy");
+      status.error(detail === "no world" || !(state && state.world) ? t("dialog.no_world") : t("dialog.busy"));
     }
   });
   row.append(add, del, gen);
@@ -1414,20 +1623,24 @@ function mountCardEditor(host, cardsData, options) {
     labeled(t("cards.title"), title),
     labeled(t("cards.desc"), desc),
     labeled(t("cards.triggers"), triggers, t("cards.empty_triggers")),
-    note,
+    status.node,
     row,
   );
   left.append(listLabel, search, list);
   layout.append(left, right);
   host.append(layout);
   write();
+  read();
+  savedCards = cardSignature(cards);
   draw();
+  if (saveEnabled) layout.addEventListener("input", touchCards);
   applyCardDescription = (event) => {
     if (String(event.title || "").trim() !== pendingTitle) return;
     const card = cards[pendingIndex];
     if (!card) return;
     card.description = event.text || "";
     if (pendingIndex === current) desc.value = card.description;
+    touchCards();
   };
   return { read };
 }
@@ -1650,9 +1863,10 @@ async function renderFiles() {
     const note = document.createElement("p");
     note.className = "error";
     note.textContent = t("dialog.no_world");
-    panelBody.append(note);
+    if (panel.dataset.panel === "files") panelBody.append(note);
     return;
   }
+  if (panel.dataset.panel !== "files") return;
   for (const name of Object.keys(files)) files[name] = unixText(files[name]);
   const original = { ...files };
   const names = Object.keys(files);
@@ -1674,24 +1888,37 @@ async function renderFiles() {
     button.type = "button";
     button.dataset.file = name;
     setNodeText(button, t(`world_file.${name}`));
-    button.addEventListener("click", () => show(name));
+    button.addEventListener("click", () => {
+      show(name);
+      touchFiles();
+    });
     buttons.append(button);
   }
-  area.addEventListener("input", () => { files[current] = area.value; });
+  const status = statusLine();
+  function filesDirty() {
+    if (current) files[current] = area.value;
+    return names.some((name) => files[name] !== original[name]);
+  }
+  function touchFiles() {
+    const dirty = filesDirty();
+    armPanelGuard(filesDirty);
+    status.settle(dirty);
+  }
+  area.addEventListener("input", touchFiles);
   if (current) show(current);
   const save = document.createElement("button");
   save.type = "button";
+  save.className = "primary";
   save.textContent = t("btn.save");
-  const note = document.createElement("p");
-  note.className = "error";
   save.addEventListener("click", async () => {
-    if (current) files[current] = area.value;
-    const dirty = names.filter((name) => files[name] !== original[name]);
-    if (!dirty.length) return;
-    note.textContent = "";
+    if (!filesDirty()) {
+      status.unchanged();
+      return;
+    }
     try {
       let fill = null;
-      for (const name of dirty) {
+      for (const name of names) {
+        if (files[name] === original[name]) continue;
         const result = await api(`/api/files/${encodeURIComponent(name)}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -1702,16 +1929,20 @@ async function renderFiles() {
       }
       if (fill) paintFill(fill);
       await refresh("keep");
+      status.saved();
+      armPanelGuard(filesDirty);
     } catch (error) {
       const detail = error && error.body && error.body.detail;
-      note.textContent = detail === "no world" || !(state && state.world) ? t("dialog.no_world") : t("dialog.busy");
+      status.error(detail === "no world" || !(state && state.world) ? t("dialog.no_world") : t("dialog.busy"));
     }
   });
-  panelBody.append(buttons, area, note, save);
+  panelBody.append(buttons, area, status.node, save);
+  touchFiles();
 }
 
 async function renderCards() {
   const data = await api("/api/cards");
+  if (panel.dataset.panel !== "cards") return;
   mountCardEditor(panelBody, data);
 }
 
@@ -2044,15 +2275,24 @@ async function renderSettings() {
     const note = document.createElement("p");
     note.className = "error";
     note.textContent = actionErrorText(error) || t("dialog.busy");
-    panelBody.append(note);
+    if (panel.dataset.panel === "settings") panelBody.append(note);
     return;
   }
+  if (panel.dataset.panel !== "settings") return;
+  rememberSettings();
   paintSettingsForm("ai");
 }
 
 function paintSettingsForm(preferredTab) {
   if (!settingsCache) return;
   panelBody.replaceChildren();
+  const status = statusLine();
+  function touchSettings() {
+    const dirty = settingsDirty();
+    armPanelGuard(() => panel.dataset.panel === "settings" && settingsDirty());
+    status.settle(dirty);
+  }
+  refreshSettingsStatus = touchSettings;
   const initial = preferredTab || "ai";
   const tabs = document.createElement("div");
   tabs.className = "tabs";
@@ -2068,6 +2308,7 @@ function paintSettingsForm(preferredTab) {
     if (which === "ai") body.append(aiFields());
     else if (which === "game") body.append(gameFields());
     else body.append(promptFields());
+    touchSettings();
   }
   for (const [id, key] of names) {
     const button = document.createElement("button");
@@ -2077,26 +2318,35 @@ function paintSettingsForm(preferredTab) {
     button.addEventListener("click", () => show(id));
     tabs.append(button);
   }
-  const error = document.createElement("p");
-  error.className = "error";
   const save = document.createElement("button");
   save.type = "button";
+  save.className = "primary";
   save.textContent = t("btn.save");
   save.addEventListener("click", async () => {
-    error.textContent = "";
+    if (!settingsDirty()) {
+      status.unchanged();
+      return;
+    }
     try {
       settingsCache = await api("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settingsCache),
+        body: JSON.stringify(settingsCache, (key, value) => (key === "button" ? undefined : value)),
       });
+      rememberSettings();
       await refresh("keep");
+      status.saved();
+      armPanelGuard(() => panel.dataset.panel === "settings" && settingsDirty());
     } catch (err) {
       const detail = err.body && err.body.detail;
-      error.textContent = detail === "busy" ? t("dialog.busy") : JSON.stringify(err.body || err.message);
+      status.error(detail === "busy" ? t("dialog.busy") : JSON.stringify(err.body || err.message));
     }
   });
-  panelBody.append(lanBlock(), tabs, body, error, save);
+  panelBody.append(lanBlock(), tabs, body, status.node, save);
+  unbindSettingsTouch();
+  settingsFormTouch = touchSettings;
+  panelBody.addEventListener("input", touchSettings);
+  panelBody.addEventListener("change", touchSettings);
   show(initial);
 
   function lanBlock() {
@@ -2207,6 +2457,34 @@ function paintSettingsForm(preferredTab) {
   }
   function aiFields() {
     const box = document.createElement("div");
+    settingsCache.task_presets = Object.assign(
+      { summary: "", memory: "", scene: "", cards: "" },
+      settingsCache.task_presets || {},
+    );
+    function taskPresetSelect(labelKey, role) {
+      const wrap = document.createElement("label");
+      wrap.textContent = t(labelKey);
+      const select = document.createElement("select");
+      const main = document.createElement("option");
+      main.value = "";
+      main.textContent = t("dialog.task_main");
+      select.append(main);
+      const names = (settingsCache.api_presets || []).map((item) => item.name);
+      const current = settingsCache.task_presets[role] || "";
+      for (const name of names) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        select.append(option);
+      }
+      select.value = names.includes(current) ? current : "";
+      if (!names.includes(current)) settingsCache.task_presets[role] = "";
+      select.addEventListener("change", () => {
+        settingsCache.task_presets[role] = select.value;
+      });
+      wrap.append(select);
+      return wrap;
+    }
     box.append(heading(t("dialog.api_config")));
     const preset = document.createElement("select");
     preset.id = "settings-preset";
@@ -2311,6 +2589,10 @@ function paintSettingsForm(preferredTab) {
       if (!window.confirm(question)) return;
       settingsCache.api_presets = (settingsCache.api_presets || []).filter((item) => item.name !== name);
       settingsCache.active_api_preset = "";
+      settingsCache.task_presets = settingsCache.task_presets || {};
+      for (const role of ["summary", "memory", "scene", "cards"]) {
+        if (settingsCache.task_presets[role] === name) settingsCache.task_presets[role] = "";
+      }
       error.textContent = "";
       show("ai");
     });
@@ -2328,6 +2610,11 @@ function paintSettingsForm(preferredTab) {
       reasoningLimit,
       field(t("dialog.temperature"), "temperature", { type: "number", min: 0, max: 2, step: 0.1 }),
       field(t("dialog.context_size"), "context_size", { type: "number", min: 4096, max: 131072, step: 4096 }),
+      heading(t("dialog.task_presets")),
+      taskPresetSelect("dialog.task_summary", "summary"),
+      taskPresetSelect("dialog.task_memory", "memory"),
+      taskPresetSelect("dialog.task_scene", "scene"),
+      taskPresetSelect("dialog.task_cards", "cards"),
     );
     return box;
   }
@@ -2542,6 +2829,7 @@ function paintSettingsForm(preferredTab) {
       area.value = selected.builtin;
       selected.text = selected.builtin;
       settingsCache.prompt_overrides[lang][selected.key] = "";
+      touchSettings();
     });
     box.append(list, area, limitWrap, reset);
     return box;
